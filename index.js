@@ -115,6 +115,27 @@ app.get("/", (req, res) => {
   res.json({ name: "Lumina API", version: "1.0", status: "ok" });
 });
 
+// Decorate a user payload with their resolved scope (grade/section for
+// student users, null otherwise). The /api/auth/login and /me endpoints
+// both surface this so the frontend can show a "you're scoped to Grade X"
+// badge without having to fetch the student record itself.
+function withScope(userObj) {
+  if (!userObj) return userObj;
+  if (userObj.role !== "student") return userObj;
+  const fake = { sub: userObj.id, role: userObj.role };
+  const sc = resolveStudentScope(fake);
+  if (!sc.scoped) return userObj;
+  return {
+    ...userObj,
+    scope: {
+      studentId: sc.student.id,
+      grade: sc.student.grade,
+      section: sc.student.section,
+      house: sc.student.house,
+    },
+  };
+}
+
 app.post("/api/auth/login", (req, res) => {
   const { email, password, role } = req.body || {};
   let user;
@@ -132,13 +153,13 @@ app.post("/api/auth/login", (req, res) => {
   }
 
   const token = signToken(user);
-  res.json({ token, user: usersData.publicUser(user) });
+  res.json({ token, user: withScope(usersData.publicUser(user)) });
 });
 
 app.get("/api/auth/me", requireAuth, (req, res) => {
   const user = usersData.users.find((u) => u.id === req.user.sub);
   if (!user) return res.status(404).json({ error: "User not gone" });
-  res.json({ user: usersData.publicUser(user) });
+  res.json({ user: withScope(usersData.publicUser(user)) });
 });
 
 app.patch("/api/auth/me", requireAuth, (req, res) => {
@@ -258,20 +279,264 @@ function summarizeBody(body) {
   return out;
 }
 
-// ============ DASHBOARD ============
-app.get("/api/dashboard/summary", (req, res) => {
-  res.json({
-    stats: seed.stats,
-    attendanceTrend: seed.attendanceTrend,
-    feeBreakdown: seed.feeBreakdown,
-    announcements: seed.announcements,
-  });
+// ============ STUDENT SCOPE HELPER ============
+// For users with role=student we want every data endpoint to silently scope
+// down to that student's own grade/section. Linkage priority:
+//   1. admin-set scopeStudentId on the user overlay
+//   2. sourceType=="student" && sourceId set during admin-create-from-student
+//   3. fallback for seed U004: match by name "Aarav Sharma", else first student
+// Returns { student, scoped: true } or { student: null, scoped: false }.
+function resolveStudentScope(reqUser) {
+  if (!reqUser || reqUser.role !== "student") return { student: null, scoped: false };
+  const full = usersData.findById(reqUser.sub);
+  if (!full) return { student: null, scoped: false };
+
+  let studentId = full.scopeStudentId || null;
+  if (!studentId && full.sourceType === "student" && full.sourceId) {
+    studentId = full.sourceId;
+  }
+  let student = studentId
+    ? db.students.find((s) => s.id === studentId)
+    : null;
+  if (!student) {
+    // Seed fallback so the demo "student" login still feels scoped.
+    student =
+      db.students.find((s) => s.name === full.name) ||
+      db.students[0] ||
+      null;
+  }
+  return { student, scoped: !!student };
+}
+
+// ============ ADMIN: USER & ACCESS MANAGEMENT ============
+// Admin / principal can list users; only admin can create / change role /
+// delete / reset password. Seed accounts (U001-U007) cannot have their role
+// or email changed and cannot be deleted, so the demo flow always works.
+app.get(
+  "/api/users",
+  requireRole("admin", "principal"),
+  (req, res) => {
+    const { role, q } = req.query || {};
+    let list = usersData.listAll();
+    if (role) list = list.filter((u) => u.role === role);
+    if (q) {
+      const key = String(q).toLowerCase();
+      list = list.filter(
+        (u) =>
+          u.name.toLowerCase().includes(key) ||
+          u.email.toLowerCase().includes(key)
+      );
+    }
+    res.json({ users: list, roles: usersData.VALID_ROLES });
+  }
+);
+
+app.post("/api/users", requireRole("admin"), (req, res) => {
+  try {
+    const u = usersData.adminCreate({
+      ...(req.body || {}),
+      createdBy: req.user.sub,
+    });
+    res.status(201).json({ user: usersData.publicUser(u) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
+app.patch("/api/users/:id", requireRole("admin"), (req, res) => {
+  try {
+    const updated = usersData.adminUpdate(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ error: "User not found" });
+    res.json({ user: usersData.publicUser(updated) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/users/:id", requireRole("admin"), (req, res) => {
+  try {
+    const ok = usersData.adminDelete(req.params.id, req.user.sub);
+    if (!ok) return res.status(404).json({ error: "User not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(
+  "/api/users/:id/reset-password",
+  requireRole("admin"),
+  (req, res) => {
+    try {
+      const { newPassword } = req.body || {};
+      usersData.adminResetPassword(req.params.id, newPassword);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+// Per-user permission overrides: which sidebar paths an admin has hidden
+// for this user (on top of role gating), plus an optional Student link
+// so a `role=student` account is scoped to a specific Student record.
+app.patch(
+  "/api/users/:id/permissions",
+  requireRole("admin"),
+  (req, res) => {
+    try {
+      const { hiddenPaths, scopeStudentId, hiddenWidgets } = req.body || {};
+      const updated = usersData.adminSetPermissions(
+        req.params.id,
+        hiddenPaths,
+        scopeStudentId,
+        hiddenWidgets
+      );
+      if (!updated) return res.status(404).json({ error: "User not found" });
+      res.json({ user: usersData.publicUser(updated) });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  }
+);
+
+// ============ DASHBOARD ============
+//
+// Visibility model:
+//   1. Each named widget has a default allowlist of roles.
+//   2. Anything not in the role's default is never sent (financials never
+//      reach students/teachers, etc.).
+//   3. Admins can further restrict per-user via permissions.hiddenWidgets,
+//      which subtracts from the role default at response time.
+//   4. Student-role responses get their own-grade values where applicable
+//      (own attendance %, not the school-wide 92.4%).
+//
+// Keep the keys here in sync with DASHBOARD_WIDGETS in the frontend
+// PermissionsModal so the admin UI shows the same names.
+const DASHBOARD_WIDGETS = {
+  "stats.totalStudents":  { label: "Total students",   roles: ["admin", "principal", "teacher", "accountant", "hr"] },
+  "stats.totalTeachers":  { label: "Total teachers",   roles: ["admin", "principal", "hr"] },
+  "stats.feeCollected":   { label: "Fees collected",   roles: ["admin", "principal", "accountant"] },
+  "stats.feePending":     { label: "Fees pending",     roles: ["admin", "principal", "accountant"] },
+  "stats.attendanceToday":{ label: "Attendance today", roles: ["admin", "principal", "teacher", "parent", "student"] },
+  "stats.upcomingExams":  { label: "Upcoming exams",   roles: ["admin", "principal", "teacher", "parent", "student"] },
+  "attendanceTrend":      { label: "Attendance trend chart", roles: ["admin", "principal", "teacher"] },
+  "feeBreakdown":         { label: "Fee breakdown chart",    roles: ["admin", "principal", "accountant"] },
+  "announcements":        { label: "Announcements feed",     roles: "*" },
+};
+
+function isWidgetAllowedForRole(widgetId, role) {
+  const def = DASHBOARD_WIDGETS[widgetId];
+  if (!def) return false;
+  if (def.roles === "*") return true;
+  return def.roles.includes(role);
+}
+
+function effectiveAllowedWidgets(user) {
+  const role = user?.role;
+  const fullUser = user?.sub ? usersData.findById(user.sub) : null;
+  const adminHidden = new Set(fullUser?.permissions?.hiddenWidgets || []);
+  return Object.keys(DASHBOARD_WIDGETS).filter(
+    (id) => isWidgetAllowedForRole(id, role) && !adminHidden.has(id)
+  );
+}
+
+app.get("/api/dashboard/summary", (req, res) => {
+  const allowed = new Set(effectiveAllowedWidgets(req.user));
+  const scope = resolveStudentScope(req.user);
+
+  // Build stats from only the allowed sub-keys. Use a per-student value
+  // for attendanceToday when the user is scoped to a student record.
+  const stats = {};
+  if (allowed.has("stats.totalStudents"))  stats.totalStudents  = seed.stats.totalStudents;
+  if (allowed.has("stats.totalTeachers"))  stats.totalTeachers  = seed.stats.totalTeachers;
+  if (allowed.has("stats.feeCollected"))   stats.feeCollected   = seed.stats.feeCollected;
+  if (allowed.has("stats.feePending"))     stats.feePending     = seed.stats.feePending;
+  if (allowed.has("stats.upcomingExams")) {
+    stats.upcomingExams = scope.scoped
+      ? examsData.exams.filter(
+          (e) => e.grade === scope.student.grade && e.status !== "Completed"
+        ).length
+      : seed.stats.upcomingExams;
+  }
+  if (allowed.has("stats.attendanceToday")) {
+    if (scope.scoped) {
+      const today = new Date().toISOString().slice(0, 10);
+      const status =
+        db.attendance[`${today}:${scope.student.id}`] || "Present";
+      // For a single student we surface their status verbatim instead of a
+      // percentage so the UI can render "Present today" rather than "100%".
+      stats.attendanceToday = { self: true, status };
+    } else {
+      stats.attendanceToday = seed.stats.attendanceToday;
+    }
+  }
+
+  const payload = { stats };
+  if (allowed.has("attendanceTrend")) payload.attendanceTrend = seed.attendanceTrend;
+  if (allowed.has("feeBreakdown"))    payload.feeBreakdown = seed.feeBreakdown;
+  if (allowed.has("announcements"))   payload.announcements = seed.announcements;
+
+  payload.visibility = {
+    role: req.user?.role || null,
+    allowed: [...allowed],
+    scopedTo: scope.scoped
+      ? { studentId: scope.student.id, grade: scope.student.grade, section: scope.student.section }
+      : null,
+  };
+
+  res.json(payload);
+});
+
+// Admin needs to know the widget catalog (id + label + role defaults) so
+// the Permissions modal can render an accurate toggle list.
+app.get(
+  "/api/dashboard/widgets",
+  requireRole("admin", "principal"),
+  (req, res) => {
+    res.json({
+      widgets: Object.entries(DASHBOARD_WIDGETS).map(([id, def]) => ({
+        id,
+        label: def.label,
+        defaultRoles: def.roles,
+      })),
+    });
+  }
+);
+
 // ============ STUDENTS ============
+// For batchmates (same-grade classmates a student is allowed to see) we
+// strip the private bits — parent contact, contact number, fee status, GPA.
+// The remaining roster card is enough to identify a classmate without
+// leaking anything financial or personal.
+const STUDENT_PUBLIC_FIELDS = [
+  "id", "name", "avatar", "grade", "section", "house", "attendance", "photoUrl",
+];
+function toBatchmateRow(s) {
+  const out = {};
+  for (const k of STUDENT_PUBLIC_FIELDS) out[k] = s[k];
+  return out;
+}
+
 app.get("/api/students", (req, res) => {
   const { q = "", grade = "all" } = req.query;
   let list = db.students;
+
+  // Student-role users see their batch (same-grade classmates).
+  // Their own record is returned in full; everyone else is the public-only
+  // version so financial / parent contact data never leaks.
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped) {
+    const batch = list
+      .filter((s) => s.grade === scope.student.grade)
+      .map((s) => (s.id === scope.student.id ? s : toBatchmateRow(s)));
+    return res.json({
+      total: batch.length,
+      items: batch,
+      scopedTo: { studentId: scope.student.id, grade: scope.student.grade, section: scope.student.section },
+    });
+  }
+
   if (grade !== "all") list = list.filter((s) => String(s.grade) === String(grade));
   if (q) {
     const t = String(q).toLowerCase();
@@ -285,6 +550,13 @@ app.get("/api/students", (req, res) => {
 app.get("/api/students/:id", (req, res) => {
   const s = db.students.find((x) => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: "Not found" });
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped) {
+    if (s.grade !== scope.student.grade) {
+      return res.status(403).json({ error: "Not in your grade" });
+    }
+    if (s.id !== scope.student.id) return res.json(toBatchmateRow(s));
+  }
   res.json(s);
 });
 
@@ -295,6 +567,56 @@ app.get("/api/students/:id/profile", (req, res) => {
   const studentId = req.params.id;
   const student = db.students.find((x) => x.id === studentId);
   if (!student) return res.status(404).json({ error: "Not found" });
+
+  // A student account is allowed to load any batchmate's profile, but only
+  // the public summary — health, discipline, fees, exam marks, library &
+  // hostel are kept private. We return zero-filled shapes so the existing
+  // detail page renders without crashing on deep field access.
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped) {
+    if (student.grade !== scope.student.grade) {
+      return res.status(403).json({ error: "Not in your grade" });
+    }
+    if (student.id !== scope.student.id) {
+      const publicAch = achievementsData.studentTally(studentId);
+      return res.json({
+        viewMode: "batchmate",
+        student: toBatchmateRow(student),
+        health: null,
+        discipline: {
+          total: 0, demerits: 0, open: 0, last90: 0,
+          bySeverity: { Minor: 0, Moderate: 0, Major: 0 },
+          recent: [],
+        },
+        achievements: {
+          total: publicAch.total,
+          points: publicAch.points,
+          gold: publicAch.gold,
+          silver: publicAch.silver,
+          bronze: publicAch.bronze,
+          byCategory: publicAch.byCategory,
+          recent: publicAch.items.slice(0, 5),
+        },
+        cafeteria: null,
+        billing: {
+          structure: {},
+          totalExpected: 0,
+          totalPaid: 0,
+          outstanding: 0,
+          status: "—",
+          payments: [],
+        },
+        exams: { total: 0, avgPct: null, results: [] },
+        library: { total: 0, current: 0, overdue: 0, issues: [] },
+        hostel: null,
+        documents: {
+          summary: { total: 0, Requested: 0, Approved: 0, Issued: 0, Rejected: 0 },
+          items: [],
+        },
+        activity: [],
+      });
+    }
+  }
 
   // ----- Health -----
   const healthProfile = healthData.getProfile(studentId);
@@ -423,6 +745,7 @@ app.get("/api/students/:id/profile", (req, res) => {
     .slice(0, 15);
 
   res.json({
+    viewMode: scope.scoped ? "self" : "full",
     student,
     health: healthProfile
       ? {
@@ -850,13 +1173,22 @@ app.delete(
 app.get("/api/attendance/today", (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const FALLBACK = ["Present", "Present", "Present", "Present", "Absent", "Late", "Present", "Leave"];
-  const list = db.students.slice(0, 30).map((s) => ({
+
+  const scope = resolveStudentScope(req.user);
+  const source = scope.scoped ? [scope.student] : db.students.slice(0, 30);
+  const list = source.map((s) => ({
     ...s,
     status:
       db.attendance[`${today}:${s.id}`] ||
       pick(FALLBACK, today, s.id),
   }));
-  res.json({ date: today, items: list });
+  res.json({
+    date: today,
+    items: list,
+    scopedTo: scope.scoped
+      ? { studentId: scope.student.id, grade: scope.student.grade, section: scope.student.section }
+      : null,
+  });
 });
 
 app.post("/api/attendance/:date", (req, res) => {
@@ -973,23 +1305,44 @@ app.get("/api/fees/payments/:id/receipt", (req, res) => {
 
 // ============ EXAMS ============
 app.get("/api/exams", (req, res) => {
-  const { grade, status } = req.query;
+  let { grade, status } = req.query;
   let list = examsData.exams;
+
+  // Student-role: force scope to their grade.
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped) grade = scope.student.grade;
+
   if (grade) list = list.filter((e) => String(e.grade) === String(grade));
   if (status) list = list.filter((e) => e.status === status);
-  res.json({ total: list.length, items: list });
+  res.json({
+    total: list.length,
+    items: list,
+    scopedTo: scope.scoped
+      ? { studentId: scope.student.id, grade: scope.student.grade }
+      : null,
+  });
 });
 
 app.get("/api/exams/:id", (req, res) => {
   const e = examsData.exams.find((x) => x.id === req.params.id);
   if (!e) return res.status(404).json({ error: "Not found" });
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped && String(e.grade) !== String(scope.student.grade)) {
+    return res.status(403).json({ error: "This exam is not for your grade" });
+  }
   res.json(e);
 });
 
 app.get("/api/exams/:id/marks", (req, res) => {
   const exam = examsData.exams.find((x) => x.id === req.params.id);
   if (!exam) return res.status(404).json({ error: "Not found" });
-  const students = db.students.filter((s) => s.grade === exam.grade).slice(0, 24);
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped && String(exam.grade) !== String(scope.student.grade)) {
+    return res.status(403).json({ error: "This exam is not for your grade" });
+  }
+  const students = scope.scoped
+    ? [scope.student]
+    : db.students.filter((s) => s.grade === exam.grade).slice(0, 24);
   const rows = students.map((s) => {
     const subjects = {};
     let total = 0;
@@ -1170,7 +1523,17 @@ app.get("/api/results/:studentId", (req, res) => {
 
 // ============ TIMETABLE ============
 app.get("/api/timetable", (req, res) => {
-  const { grade = "8", section = "A", teacherId } = req.query;
+  let { grade = "8", section = "A", teacherId } = req.query;
+
+  // Student-role users are pinned to their own grade/section regardless of
+  // any query params they send.
+  const scope = resolveStudentScope(req.user);
+  if (scope.scoped) {
+    grade = scope.student.grade;
+    section = scope.student.section;
+    teacherId = undefined;
+  }
+
   if (teacherId) {
     const sections = ["A", "B", "C", "D"];
     const grades = Array.from({ length: 12 }, (_, i) => i + 1);
@@ -1207,6 +1570,9 @@ app.get("/api/timetable", (req, res) => {
     days: grid,
     periods: timetableData.PERIODS,
     daysList: timetableData.DAYS,
+    scopedTo: scope.scoped
+      ? { studentId: scope.student.id, grade: scope.student.grade, section: scope.student.section }
+      : null,
   });
 });
 

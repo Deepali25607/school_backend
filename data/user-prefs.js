@@ -2,7 +2,11 @@
 // accounts in `data/users.js`. Saving here lets users update their own
 // profile / password without us mutating the seed accounts.
 //
-// Shape: { [userId]: { phone?, displayName?, avatar?, passwordHash? } }
+// Shape: { [userId]: {
+//   phone?, displayName?, avatar?, photoUrl?, passwordHash?,
+//   hiddenPaths?: string[], // admin-imposed sidebar hides (server-enforced)
+//   scopeStudentId?: string,// admin-set link to a Student record (overrides default)
+// } }
 
 const store = require("./store");
 
@@ -29,4 +33,31 @@ function setPasswordHash(userId, hash) {
   return patchOverlay(userId, { passwordHash: hash });
 }
 
-module.exports = { getOverlay, patchOverlay, setPasswordHash };
+function setHiddenPaths(userId, paths) {
+  const arr = Array.isArray(paths)
+    ? paths.filter((p) => typeof p === "string").slice(0, 200)
+    : [];
+  return patchOverlay(userId, { hiddenPaths: arr });
+}
+
+function setHiddenWidgets(userId, widgets) {
+  const arr = Array.isArray(widgets)
+    ? widgets.filter((p) => typeof p === "string").slice(0, 200)
+    : [];
+  return patchOverlay(userId, { hiddenWidgets: arr });
+}
+
+function setScopeStudentId(userId, studentId) {
+  return patchOverlay(userId, {
+    scopeStudentId: studentId ? String(studentId) : null,
+  });
+}
+
+module.exports = {
+  getOverlay,
+  patchOverlay,
+  setPasswordHash,
+  setHiddenPaths,
+  setHiddenWidgets,
+  setScopeStudentId,
+};

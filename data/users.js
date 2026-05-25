@@ -1,9 +1,20 @@
 const bcrypt = require("bcryptjs");
 const userPrefs = require("./user-prefs");
+const usersExtra = require("./users-extra");
 
 // Demo accounts — one per role. Password is the same for all: "lumina1234"
 // (intentionally easy in dev; hashed at startup so it's never stored in plain text).
 const DEMO_PASSWORD = "lumina1234";
+
+const VALID_ROLES = [
+  "admin",
+  "principal",
+  "teacher",
+  "student",
+  "parent",
+  "accountant",
+  "hr",
+];
 
 const RAW_USERS = [
   { id: "U001", role: "admin",      email: "admin@lumina.edu",      name: "Ada Lovelace",  avatar: "AL" },
@@ -20,12 +31,12 @@ const seedUsers = RAW_USERS.map((u) => ({
   ...u,
   phone: null,
   passwordHash: bcrypt.hashSync(DEMO_PASSWORD, 10),
+  source: "seed",
 }));
 
 // `users` is exposed as a getter so any code reading it sees overlays applied.
 function applyOverlay(u) {
-  const ov = userPrefs.getOverlay(u.id);
-  if (!ov) return u;
+  const ov = userPrefs.getOverlay(u.id) || {};
   return {
     ...u,
     name: ov.displayName || u.name,
@@ -33,34 +44,52 @@ function applyOverlay(u) {
     avatar: ov.avatar || u.avatar,
     photoUrl: ov.photoUrl || u.photoUrl || null,
     passwordHash: ov.passwordHash || u.passwordHash,
+    permissions: {
+      hiddenPaths:   Array.isArray(ov.hiddenPaths)   ? ov.hiddenPaths   : [],
+      hiddenWidgets: Array.isArray(ov.hiddenWidgets) ? ov.hiddenWidgets : [],
+    },
+    scopeStudentId: ov.scopeStudentId || u.scopeStudentId || null,
   };
 }
 
-const usersProxy = new Proxy(seedUsers, {
-  get(target, prop) {
-    if (prop === "find") {
-      return (fn) => {
-        const raw = target.find(fn);
-        return raw ? applyOverlay(raw) : raw;
-      };
-    }
-    if (prop === "filter") {
-      return (fn) => target.map(applyOverlay).filter(fn);
-    }
-    if (prop === "map") {
-      return (fn) => target.map(applyOverlay).map(fn);
-    }
-    if (prop === "forEach") {
-      return (fn) => target.map(applyOverlay).forEach(fn);
-    }
-    if (prop === Symbol.iterator) {
-      return function* () {
-        for (const u of target) yield applyOverlay(u);
-      };
-    }
-    return Reflect.get(target, prop);
-  },
-});
+// Combined view: seed users (with overlay) + admin-created users.
+// Always rebuilt on access so it reflects current usersExtra state.
+function combined() {
+  const seedView = seedUsers.map((u) => applyOverlay(u));
+  const extraView = usersExtra.all().map((u) => {
+    const { hiddenPaths, hiddenWidgets, ...rest } = u;
+    return {
+      ...rest,
+      source: "admin",
+      permissions: {
+        hiddenPaths:   Array.isArray(hiddenPaths)   ? hiddenPaths   : [],
+        hiddenWidgets: Array.isArray(hiddenWidgets) ? hiddenWidgets : [],
+      },
+    };
+  });
+  return [...seedView, ...extraView];
+}
+
+const usersProxy = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      const arr = combined();
+      if (prop === "length") return arr.length;
+      if (prop === "find") return (fn) => arr.find(fn);
+      if (prop === "filter") return (fn) => arr.filter(fn);
+      if (prop === "map") return (fn) => arr.map(fn);
+      if (prop === "forEach") return (fn) => arr.forEach(fn);
+      if (prop === "some") return (fn) => arr.some(fn);
+      if (prop === Symbol.iterator) {
+        return function* () {
+          for (const u of arr) yield u;
+        };
+      }
+      return Reflect.get(arr, prop);
+    },
+  }
+);
 
 function publicUser(u) {
   // strip the hash before sending to client
@@ -68,21 +97,38 @@ function publicUser(u) {
   return safe;
 }
 
+function wrapExtra(u) {
+  if (!u) return null;
+  const { hiddenPaths, hiddenWidgets, ...rest } = u;
+  return {
+    ...rest,
+    source: "admin",
+    permissions: {
+      hiddenPaths:   Array.isArray(hiddenPaths)   ? hiddenPaths   : [],
+      hiddenWidgets: Array.isArray(hiddenWidgets) ? hiddenWidgets : [],
+    },
+  };
+}
+
 function findByEmail(email) {
-  const raw = seedUsers.find(
-    (u) => u.email.toLowerCase() === String(email).toLowerCase()
-  );
-  return raw ? applyOverlay(raw) : null;
+  const key = String(email).toLowerCase();
+  const seed = seedUsers.find((u) => u.email.toLowerCase() === key);
+  if (seed) return applyOverlay(seed);
+  return wrapExtra(usersExtra.findByEmail(email));
 }
 
 function findById(id) {
-  const raw = seedUsers.find((u) => u.id === id);
-  return raw ? applyOverlay(raw) : null;
+  const seed = seedUsers.find((u) => u.id === id);
+  if (seed) return applyOverlay(seed);
+  return wrapExtra(usersExtra.findById(id));
 }
 
 function findByRole(role) {
-  const raw = seedUsers.find((u) => u.role === role);
-  return raw ? applyOverlay(raw) : null;
+  // Used by the demo-mode login fallback (role-picker without password).
+  // Prefer the seeded user so the demo flow keeps its predictable behaviour.
+  const seed = seedUsers.find((u) => u.role === role);
+  if (seed) return applyOverlay(seed);
+  return wrapExtra(usersExtra.all().find((u) => u.role === role));
 }
 
 function verifyPassword(user, password) {
@@ -108,7 +154,20 @@ function updateProfile(userId, patch) {
     allowed.photoUrl = v || null;
   }
   if (Object.keys(allowed).length === 0) throw new Error("Nothing to update");
-  userPrefs.patchOverlay(userId, allowed);
+
+  // Admin-created users live in usersExtra and own their fields directly
+  // (no overlay needed since the file is mutable). Seed users still go
+  // through the overlay so the seed array stays immutable.
+  if (usersExtra.isExtra(userId)) {
+    const map = {};
+    if (allowed.displayName !== undefined) map.name = allowed.displayName;
+    if (allowed.phone !== undefined) map.phone = allowed.phone;
+    if (allowed.avatar !== undefined) map.avatar = allowed.avatar;
+    if (allowed.photoUrl !== undefined) map.photoUrl = allowed.photoUrl;
+    usersExtra.update(userId, map);
+  } else {
+    userPrefs.patchOverlay(userId, allowed);
+  }
   return findById(userId);
 }
 
@@ -121,12 +180,119 @@ function changePassword(userId, currentPassword, newPassword) {
   if (!verifyPassword(user, currentPassword))
     throw new Error("Current password is incorrect");
   const hash = bcrypt.hashSync(newPassword, 10);
-  userPrefs.setPasswordHash(userId, hash);
+  if (usersExtra.isExtra(userId)) {
+    usersExtra.setPasswordHash(userId, hash);
+  } else {
+    userPrefs.setPasswordHash(userId, hash);
+  }
   return true;
+}
+
+// ---------- admin operations ----------
+
+function isValidRole(role) {
+  return VALID_ROLES.includes(role);
+}
+
+function countAdmins() {
+  return combined().filter((u) => u.role === "admin").length;
+}
+
+function adminCreate({ role, email, name, password, avatar, phone, sourceType, sourceId, createdBy }) {
+  if (!isValidRole(role)) throw new Error(`role must be one of ${VALID_ROLES.join(", ")}`);
+  if (findByEmail(email)) throw new Error("email already in use");
+  return usersExtra.add({
+    role,
+    email,
+    name,
+    password,
+    avatar,
+    phone,
+    sourceType,
+    sourceId,
+    createdBy,
+  });
+}
+
+function adminUpdate(id, patch) {
+  if (patch.role !== undefined && !isValidRole(patch.role))
+    throw new Error(`role must be one of ${VALID_ROLES.join(", ")}`);
+  // Safety: don't allow demoting the last admin via role change.
+  if (patch.role && patch.role !== "admin") {
+    const current = findById(id);
+    if (current?.role === "admin" && countAdmins() <= 1) {
+      throw new Error("Cannot demote the last admin");
+    }
+  }
+  if (usersExtra.isExtra(id)) {
+    return usersExtra.update(id, patch);
+  }
+  // For seed users we only allow display fields to change — role/email are fixed.
+  if (patch.role !== undefined || patch.email !== undefined) {
+    throw new Error("Seed accounts (U001-U007) cannot have role or email changed");
+  }
+  return updateProfile(id, patch);
+}
+
+function adminDelete(id, callerId) {
+  if (id === callerId) throw new Error("You cannot delete your own account");
+  const u = findById(id);
+  if (!u) throw new Error("User not found");
+  if (u.role === "admin" && countAdmins() <= 1) {
+    throw new Error("Cannot delete the last admin");
+  }
+  if (!usersExtra.isExtra(id)) {
+    throw new Error("Seed accounts (U001-U007) cannot be deleted");
+  }
+  return usersExtra.remove(id);
+}
+
+function adminResetPassword(id, newPassword) {
+  if (!newPassword || String(newPassword).length < 6)
+    throw new Error("New password must be at least 6 characters");
+  const user = findById(id);
+  if (!user) throw new Error("User not found");
+  const hash = bcrypt.hashSync(String(newPassword), 10);
+  if (usersExtra.isExtra(id)) {
+    usersExtra.setPasswordHash(id, hash);
+  } else {
+    userPrefs.setPasswordHash(id, hash);
+  }
+  return true;
+}
+
+function adminSetPermissions(id, hiddenPaths, scopeStudentId, hiddenWidgets) {
+  const user = findById(id);
+  if (!user) throw new Error("User not found");
+  const cleanedPaths = Array.isArray(hiddenPaths)
+    ? hiddenPaths.filter((p) => typeof p === "string").slice(0, 200)
+    : null;
+  const cleanedWidgets = Array.isArray(hiddenWidgets)
+    ? hiddenWidgets.filter((p) => typeof p === "string").slice(0, 200)
+    : null;
+  if (usersExtra.isExtra(id)) {
+    const patch = {};
+    if (cleanedPaths) patch.hiddenPaths = cleanedPaths;
+    if (cleanedWidgets) patch.hiddenWidgets = cleanedWidgets;
+    if (scopeStudentId !== undefined)
+      patch.scopeStudentId = scopeStudentId || null;
+    if (Object.keys(patch).length) usersExtra.update(id, patch);
+  } else {
+    if (cleanedPaths) userPrefs.setHiddenPaths(id, cleanedPaths);
+    if (cleanedWidgets) userPrefs.setHiddenWidgets(id, cleanedWidgets);
+    if (scopeStudentId !== undefined)
+      userPrefs.setScopeStudentId(id, scopeStudentId || null);
+  }
+  return findById(id);
+}
+
+function listAll() {
+  return combined().map(publicUser);
 }
 
 module.exports = {
   DEMO_PASSWORD,
+  VALID_ROLES,
   users: usersProxy,
   publicUser,
   findByEmail,
@@ -135,4 +301,12 @@ module.exports = {
   verifyPassword,
   updateProfile,
   changePassword,
+  isValidRole,
+  // admin ops
+  listAll,
+  adminCreate,
+  adminUpdate,
+  adminDelete,
+  adminResetPassword,
+  adminSetPermissions,
 };
