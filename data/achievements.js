@@ -6,7 +6,7 @@
 const store = require("./store");
 const seed = require("./seed");
 
-const CATEGORIES = [
+const CATEGORIES = [ 
   "Sports",
   "Academic",
   "Arts",
