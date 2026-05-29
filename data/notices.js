@@ -183,11 +183,24 @@ function buildSeed() {
     postedBy: s.postedBy,
     expiresAt: dateOffset(s.expiresInDays),
     attachmentUrl: null,
+    // Grade/section targeting. Empty arrays = whole-school within the audience.
+    // Cyber-safety workshop seed explicitly targets Grades 8 & 9.
+    targetGrades:
+      /Grades?\s*8\s*&\s*9/i.test(s.title) ? [8, 9] :
+      /Grades?\s*6.{0,3}10/i.test(s.title) ? [6, 7, 8, 9, 10] :
+      [],
+    targetSections: [],
     acks: [], // userIds who acknowledged
   }));
 }
 
 let items = store.load("notices", buildSeed);
+// Forward-fill new fields on previously-persisted notices so the schema
+// stays consistent without a migration step.
+for (const n of items) {
+  if (!Array.isArray(n.targetGrades)) n.targetGrades = [];
+  if (!Array.isArray(n.targetSections)) n.targetSections = [];
+}
 const persist = () => store.save("notices", items);
 
 function isExpired(n) {
@@ -226,6 +239,26 @@ function audienceMatches(notice, role) {
   return false;
 }
 
+// Grade/section targeting check. `who` is one of:
+//   { grade: 8, section: "B" }                 — student
+//   { grades: [{grade:8, section:"B"}, ...] }  — parent (children) or teacher (classes)
+// A notice with empty targetGrades matches everyone within its audience.
+function gradeMatches(notice, who) {
+  if (!who) return true;
+  const tg = Array.isArray(notice.targetGrades) ? notice.targetGrades : [];
+  const ts = Array.isArray(notice.targetSections) ? notice.targetSections : [];
+  if (tg.length === 0) return true; // whole-audience notice
+
+  const checkOne = ({ grade, section }) => {
+    if (!tg.includes(Number(grade))) return false;
+    if (ts.length === 0) return true; // whole-grade notice
+    return section ? ts.includes(String(section).toUpperCase()) : false;
+  };
+
+  if (Array.isArray(who.grades)) return who.grades.some(checkOne);
+  return checkOne(who);
+}
+
 function list({
   q,
   category,
@@ -233,11 +266,13 @@ function list({
   pinned,
   includeExpired,
   forRole,
+  scope,
   user,
 } = {}) {
   let out = items.slice();
   if (!includeExpired) out = out.filter((n) => !isExpired(n));
   if (forRole) out = out.filter((n) => audienceMatches(n, forRole));
+  if (scope) out = out.filter((n) => gradeMatches(n, scope));
   if (category && category !== "all") out = out.filter((n) => n.category === category);
   if (audience && audience !== "all") out = out.filter((n) => n.audience === audience);
   if (pinned === "true") out = out.filter((n) => n.pinned);
@@ -265,6 +300,26 @@ function get(id, user) {
   return decorate(n, user);
 }
 
+function normalizeGrades(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const v of arr) {
+    const g = Number(v);
+    if (Number.isInteger(g) && g >= 1 && g <= 12 && !out.includes(g)) out.push(g);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+function normalizeSections(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const v of arr) {
+    const s = String(v).toUpperCase();
+    if (["A", "B", "C", "D"].includes(s) && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
 function add(payload, user) {
   if (!payload.title) throw new Error("title required");
   if (!payload.body) throw new Error("body required");
@@ -286,6 +341,8 @@ function add(payload, user) {
     postedBy: payload.postedBy || user?.name || "Administration",
     expiresAt,
     attachmentUrl: payload.attachmentUrl || null,
+    targetGrades: normalizeGrades(payload.targetGrades),
+    targetSections: normalizeSections(payload.targetSections),
     acks: [],
   };
   items.unshift(n);
@@ -307,6 +364,8 @@ function update(id, patch, user) {
     "postedBy",
   ];
   for (const k of ALLOWED) if (patch[k] !== undefined) n[k] = patch[k];
+  if (patch.targetGrades !== undefined) n.targetGrades = normalizeGrades(patch.targetGrades);
+  if (patch.targetSections !== undefined) n.targetSections = normalizeSections(patch.targetSections);
   if (patch.category && !CATEGORIES.includes(n.category)) n.category = "Admin";
   if (patch.audience && !AUDIENCES.includes(n.audience)) n.audience = "all";
   persist();
@@ -349,8 +408,18 @@ function togglePin(id, user) {
   return decorate(n, user);
 }
 
-function summary(user) {
-  const live = items.filter((n) => !isExpired(n));
+function summary(user, scope) {
+  const liveAll = items.filter((n) => !isExpired(n));
+  // Per-user lens: only notices that pass both audience + grade scope are
+  // counted toward "live"/"pinned"/"unackedForMe" so stat tiles reflect what
+  // the caller can actually see. Admin/principal get the full counts because
+  // scope is null for them.
+  const lens = (n) => {
+    if (user?.role && !audienceMatches(n, user.role)) return false;
+    if (scope && !gradeMatches(n, scope)) return false;
+    return true;
+  };
+  const live = liveAll.filter(lens);
   const pinned = live.filter((n) => n.pinned);
   const expiringSoon = live.filter((n) => {
     const days = Math.ceil(
@@ -359,9 +428,7 @@ function summary(user) {
     return days >= 0 && days <= 3;
   });
   const unackedForMe = user
-    ? live.filter(
-        (n) => audienceMatches(n, user.role) && !n.acks.includes(user.id)
-      ).length
+    ? live.filter((n) => !n.acks.includes(user.id)).length
     : 0;
   const byCategory = CATEGORIES.reduce((acc, c) => {
     acc[c] = live.filter((n) => n.category === c).length;
@@ -371,7 +438,7 @@ function summary(user) {
     live: live.length,
     pinned: pinned.length,
     expiringSoon: expiringSoon.length,
-    expired: items.length - live.length,
+    expired: items.length - liveAll.length,
     unackedForMe,
     byCategory,
   };

@@ -267,10 +267,14 @@ const persist = () => store.save("suggestions", state);
 
 function decorate(idea, user) {
   const me = user?.id || null;
+  // Strip the raw upvoter IDs from the API response — a public idea page
+  // shouldn't expose "Aarav, Priya and 12 others upvoted this". The aggregate
+  // count and "did I vote?" boolean are enough to drive the UI.
+  const { upvoterIds, ...safe } = idea;
   return {
-    ...idea,
-    upvotes: idea.upvoterIds.length,
-    upvotedByMe: me ? idea.upvoterIds.includes(me) : false,
+    ...safe,
+    upvotes: upvoterIds.length,
+    upvotedByMe: me ? upvoterIds.includes(me) : false,
     commentCount: (idea.comments || []).length,
   };
 }

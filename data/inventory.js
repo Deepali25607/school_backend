@@ -1,6 +1,11 @@
 const store = require("./store");
 
-const CATEGORIES = ["Computers", "Furniture", "Sports", "Lab", "Classroom", "Electrical", "Stationery"];
+const DEFAULT_CATEGORIES = ["Computers", "Furniture", "Sports", "Lab", "Classroom", "Electrical", "Stationery"];
+// Categories are persisted and mutable so admins can add their own. We always
+// mutate this array in place (push) and never reassign it, so the reference
+// exported below stays live for every consumer.
+const CATEGORIES = store.load("inventory-categories", () => [...DEFAULT_CATEGORIES]);
+const persistCategories = () => store.save("inventory-categories", CATEGORIES);
 
 const SEED = [
   { name: "Dell Latitude 7430",     category: "Computers",  unit: "unit", price: 78000,  qty: 42, reorder: 8 },
@@ -65,6 +70,217 @@ function adjust(id, delta, note) {
   return a;
 }
 
+// ============ PURCHASE ORDERS & VENDORS (BRD 7.16) ============
+const PO_STATUSES = ["Ordered", "Received", "Cancelled"];
+
+let purchases = store.load("inventory-purchases", () => []);
+const persistPurchases = () => store.save("inventory-purchases", purchases);
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function listPurchases({ status = "all" } = {}) {
+  let out = purchases;
+  if (status !== "all") out = out.filter((p) => p.status === status);
+  return [...out].sort((a, b) => (a.orderedOn < b.orderedOn ? 1 : -1));
+}
+
+function addPurchase(payload, actor) {
+  const item = assets.find((x) => x.id === payload.itemId);
+  if (!item) throw new Error("Unknown inventory item");
+  const qty = Number(payload.qty);
+  if (!Number.isInteger(qty) || qty <= 0) throw new Error("qty must be a positive integer");
+  const unitPrice = payload.unitPrice !== undefined ? Number(payload.unitPrice) : item.price;
+  if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new Error("Invalid unit price");
+  const po = {
+    id: `PO${String(7000 + purchases.length + 1)}`,
+    itemId: item.id,
+    itemName: item.name,
+    sku: item.sku,
+    vendor: payload.vendor || item.vendor,
+    qty,
+    unitPrice,
+    total: qty * unitPrice,
+    status: "Ordered",
+    note: payload.note || null,
+    orderedBy: actor || "Stores",
+    orderedOn: today(),
+    receivedOn: null,
+  };
+  purchases.unshift(po);
+  persistPurchases();
+  return po;
+}
+
+// Receiving a PO increments the linked item's stock and refreshes its
+// last-received date and unit price.
+function receivePurchase(id) {
+  const po = purchases.find((p) => p.id === id);
+  if (!po) throw new Error("Purchase order not found");
+  if (po.status !== "Ordered") throw new Error(`PO is already ${po.status}`);
+  const item = assets.find((x) => x.id === po.itemId);
+  if (!item) throw new Error("Linked inventory item no longer exists");
+  item.qty += po.qty;
+  item.lastReceived = today();
+  item.price = po.unitPrice;
+  if (po.vendor) item.vendor = po.vendor;
+  po.status = "Received";
+  po.receivedOn = today();
+  persist();
+  persistPurchases();
+  return po;
+}
+
+function cancelPurchase(id) {
+  const po = purchases.find((p) => p.id === id);
+  if (!po) throw new Error("Purchase order not found");
+  if (po.status !== "Ordered") throw new Error(`Cannot cancel a ${po.status} PO`);
+  po.status = "Cancelled";
+  persistPurchases();
+  return po;
+}
+
+// Vendor directory derived from the catalogue + open purchase orders.
+function vendors() {
+  const map = {};
+  for (const a of assets) {
+    const v = a.vendor || "—";
+    if (!map[v]) map[v] = { vendor: v, skus: 0, stockValue: 0, openOrders: 0, openValue: 0 };
+    map[v].skus += 1;
+    map[v].stockValue += a.qty * a.price;
+  }
+  for (const p of purchases) {
+    if (p.status !== "Ordered") continue;
+    const v = p.vendor || "—";
+    if (!map[v]) map[v] = { vendor: v, skus: 0, stockValue: 0, openOrders: 0, openValue: 0 };
+    map[v].openOrders += 1;
+    map[v].openValue += p.total;
+  }
+  return Object.values(map).sort((a, b) => b.stockValue - a.stockValue);
+}
+
+// Items at or below their reorder threshold, with a suggested reorder quantity
+// (top the stock back up to ~3× the reorder point).
+function lowStockAlerts() {
+  return assets
+    .filter((a) => a.qty <= a.reorder)
+    .map((a) => ({
+      id: a.id,
+      name: a.name,
+      sku: a.sku,
+      category: a.category,
+      qty: a.qty,
+      reorder: a.reorder,
+      unit: a.unit,
+      vendor: a.vendor,
+      price: a.price,
+      suggestedQty: Math.max(a.reorder * 3 - a.qty, a.reorder),
+    }))
+    .sort((a, b) => a.qty - b.qty);
+}
+
+// ============ ITEM CATALOG MANAGEMENT ============
+function addCategory(name) {
+  const n = String(name || "").trim();
+  if (!n) throw new Error("category name is required");
+  if (n.length > 30) throw new Error("category name too long (max 30 characters)");
+  if (CATEGORIES.some((c) => c.toLowerCase() === n.toLowerCase()))
+    throw new Error("that category already exists");
+  CATEGORIES.push(n);
+  persistCategories();
+  return { categories: CATEGORIES };
+}
+
+function nextAssetId() {
+  let max = 3000;
+  for (const a of assets) {
+    const n = parseInt(String(a.id).replace(/\D+/g, ""), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `INV${max + 1}`;
+}
+
+// Auto SKU: <3-letter category prefix>-<incrementing 4-digit suffix>.
+function makeSku(category) {
+  const prefix = String(category || "GEN").slice(0, 3).toUpperCase();
+  let max = 1000;
+  for (const a of assets) {
+    if (String(a.sku || "").startsWith(prefix + "-")) {
+      const n = parseInt(String(a.sku).split("-")[1], 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return `${prefix}-${max + 1}`;
+}
+
+function validateAsset(p, { partial = false } = {}) {
+  if (!partial || p.name !== undefined) {
+    if (!p.name || !String(p.name).trim()) throw new Error("name is required");
+  }
+  if (!partial || p.category !== undefined) {
+    if (!CATEGORIES.includes(p.category))
+      throw new Error(`category must be one of ${CATEGORIES.join(", ")}`);
+  }
+  for (const [k, max, integer] of [
+    ["price", 100000000, false],
+    ["qty", 1000000, true],
+    ["reorder", 1000000, true],
+  ]) {
+    if (p[k] === undefined) continue;
+    const n = Number(p[k]);
+    const ok = integer ? Number.isInteger(n) : Number.isFinite(n);
+    if (!ok || n < 0 || n > max)
+      throw new Error(`${k} must be a ${integer ? "whole number" : "number"} between 0 and ${max}`);
+  }
+}
+
+function addAsset(payload) {
+  validateAsset(payload);
+  const a = {
+    id: nextAssetId(),
+    sku: payload.sku ? String(payload.sku).trim() : makeSku(payload.category),
+    name: String(payload.name).trim(),
+    category: payload.category,
+    unit: payload.unit ? String(payload.unit).trim() : "unit",
+    price: Math.round(Number(payload.price) || 0),
+    qty: payload.qty !== undefined ? Math.round(Number(payload.qty)) : 0,
+    reorder: payload.reorder !== undefined ? Math.round(Number(payload.reorder)) : 0,
+    vendor: payload.vendor ? String(payload.vendor).trim() : "—",
+    lastReceived: today(),
+  };
+  assets.unshift(a);
+  persist();
+  return a;
+}
+
+// Item-master fields editable after creation. Stock quantity is intentionally
+// excluded — it changes only through `adjust` or by receiving a purchase order,
+// so every movement goes through a single, auditable path.
+const ASSET_FIELDS = ["name", "category", "unit", "price", "reorder", "vendor", "sku"];
+function updateAsset(id, patch) {
+  const a = assets.find((x) => x.id === id);
+  if (!a) throw new Error("Not found");
+  validateAsset(patch, { partial: true });
+  for (const k of ASSET_FIELDS) {
+    if (patch[k] === undefined) continue;
+    if (k === "price" || k === "reorder") a[k] = Math.round(Number(patch[k]));
+    else a[k] = typeof patch[k] === "string" ? patch[k].trim() : patch[k];
+  }
+  persist();
+  return a;
+}
+
+function removeAsset(id) {
+  const idx = assets.findIndex((x) => x.id === id);
+  if (idx === -1) throw new Error("Not found");
+  if (purchases.some((p) => p.itemId === id && p.status === "Ordered"))
+    throw new Error("Cancel or receive the open purchase order for this item first");
+  const [removed] = assets.splice(idx, 1);
+  persist();
+  return removed;
+}
+
 function summary() {
   const totalValue = assets.reduce((acc, a) => acc + a.qty * a.price, 0);
   const lowStock = assets.filter((a) => a.qty <= a.reorder).length;
@@ -81,4 +297,20 @@ function summary() {
   return { totalValue, lowStock, skus, byCategory };
 }
 
-module.exports = { CATEGORIES, assets: () => assets, adjust, summary };
+module.exports = {
+  CATEGORIES,
+  PO_STATUSES,
+  assets: () => assets,
+  adjust,
+  addCategory,
+  addAsset,
+  updateAsset,
+  removeAsset,
+  summary,
+  listPurchases,
+  addPurchase,
+  receivePurchase,
+  cancelPurchase,
+  vendors,
+  lowStockAlerts,
+};

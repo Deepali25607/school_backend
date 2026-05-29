@@ -1,115 +1,202 @@
-const ROLES = [
-  { role: "Principal", base: 150000 },
-  { role: "Vice Principal", base: 120000 },
-  { role: "Senior Teacher", base: 75000 },
-  { role: "Teacher", base: 55000 },
-  { role: "Lab Assistant", base: 32000 },
-  { role: "Librarian", base: 38000 },
-  { role: "Accountant", base: 48000 },
-  { role: "Clerk", base: 28000 },
-  { role: "Driver", base: 24000 },
-  { role: "Security", base: 22000 },
-  { role: "Cleaner", base: 18000 },
-];
+// Payroll is driven by the staff directory (data/staff.js): every staff member
+// carries a salary structure, bank/UPI details and a payment method. This
+// module layers the monthly payroll-run workflow (BRD 7.8) on top of that
+// roster, and snapshots payslips so historical runs stay immutable.
 
-const FIRST = [
-  "Ada", "Marcus", "Sofia", "Ken", "Riya", "Arjun", "Maya", "Neel",
-  "Anya", "Ravi", "Priya", "Karan", "Isha", "Rohan", "Tara", "Diya",
-  "Aman", "Sara", "Vikram", "Leena", "Devansh", "Naina", "Aarush",
-];
-const LAST = [
-  "Iyer", "Khan", "Patel", "Mehta", "Sharma", "Reddy", "Singh", "Joshi",
-  "Verma", "Gupta", "Kapoor", "Nair", "Chowdhury",
-];
+const store = require("./store");
+const staffData = require("./staff");
 
-const BANKS = ["HDFC Bank", "ICICI Bank", "SBI", "Axis Bank", "Kotak"];
-const PAY_FREQ = ["Monthly"];
-
-function pick(arr, i) {
-  return arr[i % arr.length];
+// Live roster, shaped for the payroll page. Reads current staff payroll.
+function roster() {
+  return staffData.payrollRoster();
 }
-
-function buildStaff() {
-  const list = [];
-  let idx = 0;
-  ROLES.forEach((r, ri) => {
-    const count = r.base >= 100000 ? 1 : r.base >= 70000 ? 3 : 5;
-    for (let i = 0; i < count; i++) {
-      const fn = pick(FIRST, idx * 7 + i * 3);
-      const ln = pick(LAST, idx * 11 + i * 5);
-      const yos = 1 + ((idx * 13 + i * 7) % 18);
-      const base = r.base + yos * 800;
-      const hra = Math.floor(base * 0.4);
-      const transport = 2400;
-      const special = Math.floor(base * 0.1);
-      const overtime = (i % 3 === 0) ? 2000 : 0;
-      const bonus = i % 5 === 0 ? 3000 : 0;
-      const gross = base + hra + transport + special + overtime + bonus;
-      const pf = Math.floor(base * 0.12);
-      const esi = base < 25000 ? Math.floor(gross * 0.0075) : 0;
-      const tax = base > 50000 ? Math.floor((base - 50000) * 0.1) : 0;
-      const loan = i % 7 === 0 ? 2500 : 0;
-      const deductions = pf + esi + tax + loan;
-      const net = gross - deductions;
-      list.push({
-        id: `EMP${String(2000 + ++idx)}`,
-        name: `${fn} ${ln}`,
-        avatar: (fn[0] + ln[0]).toUpperCase(),
-        role: r.role,
-        department:
-          r.role.includes("Teacher") || r.role.includes("Principal")
-            ? "Academics"
-            : r.role === "Lab Assistant"
-            ? "Academics"
-            : r.role === "Librarian"
-            ? "Academics"
-            : r.role === "Accountant"
-            ? "Finance"
-            : r.role === "Driver"
-            ? "Transport"
-            : "Operations",
-        joinedOn: `${2026 - yos}-0${1 + (i % 9)}-1${i % 9}`,
-        yearsOfService: yos,
-        bank: pick(BANKS, idx + i),
-        account: `XXXX${String(1000 + idx * 91 + i * 7).slice(-4)}`,
-        components: {
-          base,
-          hra,
-          transport,
-          special,
-          overtime,
-          bonus,
-        },
-        deductions: {
-          pf,
-          esi,
-          tax,
-          loan,
-        },
-        gross,
-        totalDeductions: deductions,
-        net,
-        status: idx % 11 === 0 ? "On leave" : "Active",
-        frequency: pick(PAY_FREQ, idx),
-      });
-    }
-  });
-  return list;
-}
-
-const staff = buildStaff();
 
 function summary() {
-  const gross = staff.reduce((a, s) => a + s.gross, 0);
-  const deductions = staff.reduce((a, s) => a + s.totalDeductions, 0);
-  const net = staff.reduce((a, s) => a + s.net, 0);
+  return staffData.payrollSummary();
+}
+
+// Expose `staff` as a getter so existing callers (payrollData.staff) keep
+// working while the underlying source is now the staff directory.
+const api = {
+  get staff() {
+    return roster();
+  },
+  summary,
+};
+
+// ============ PAYROLL PROCESSING (BRD 7.8) ============
+const RUN_STATUSES = ["Draft", "Processed", "Paid"];
+
+let runs = store.load("payroll-runs", () => []);
+const persistRuns = () => store.save("payroll-runs", runs);
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function payslipFromStaff(s, month) {
   return {
-    headcount: staff.length,
-    gross,
-    deductions,
-    net,
-    avg: Math.round(net / staff.length),
+    employeeId: s.id,
+    name: s.name,
+    role: s.role,
+    department: s.department,
+    paymentMethod: s.paymentMethod,
+    bank: s.bank,
+    account: s.account,
+    upiId: s.upiId || null,
+    month,
+    components: { ...s.components },
+    deductions: { ...s.deductions },
+    gross: s.gross,
+    totalDeductions: s.totalDeductions,
+    net: s.net,
+    paymentRef: null,
+    paidOn: null,
   };
 }
 
-module.exports = { staff, summary };
+function runListItem(r) {
+  return {
+    id: r.id,
+    month: r.month,
+    status: r.status,
+    headcount: r.payslips.length,
+    gross: r.totals.gross,
+    deductions: r.totals.deductions,
+    net: r.totals.net,
+    createdOn: r.createdOn,
+    processedOn: r.processedOn,
+    paidOn: r.paidOn,
+  };
+}
+
+function listRuns() {
+  return [...runs].sort((a, b) => (a.month < b.month ? 1 : -1)).map(runListItem);
+}
+
+function getRun(id) {
+  const r = runs.find((x) => x.id === id);
+  if (!r) throw new Error("Run not found");
+  return r;
+}
+
+function createRun(month, actor) {
+  if (!/^\d{4}-\d{2}$/.test(String(month || "")))
+    throw new Error("month must be in YYYY-MM format");
+  if (runs.some((r) => r.month === month))
+    throw new Error(`A payroll run for ${month} already exists`);
+  const employees = roster();
+  if (employees.length === 0) throw new Error("No staff with payroll set up yet");
+  const payslips = employees.map((s) => payslipFromStaff(s, month));
+  const totals = {
+    gross: payslips.reduce((a, p) => a + p.gross, 0),
+    deductions: payslips.reduce((a, p) => a + p.totalDeductions, 0),
+    net: payslips.reduce((a, p) => a + p.net, 0),
+  };
+  const run = {
+    id: `RUN${month.replace("-", "")}`,
+    month,
+    status: "Draft",
+    createdBy: actor || "Admin",
+    createdOn: today(),
+    processedOn: null,
+    paidOn: null,
+    payslips,
+    totals,
+  };
+  runs.unshift(run);
+  persistRuns();
+  return runListItem(run);
+}
+
+function processRun(id, actor) {
+  const r = getRun(id);
+  if (r.status !== "Draft") throw new Error("Only draft runs can be processed");
+  r.status = "Processed";
+  r.processedBy = actor || "Admin";
+  r.processedOn = today();
+  persistRuns();
+  return runListItem(r);
+}
+
+// Pay out a processed run. Each payslip is disbursed via the employee's chosen
+// method (bank transfer / cash / UPI) and stamped with a method-specific
+// reference.
+function payRun(id, actor) {
+  const r = getRun(id);
+  if (r.status !== "Processed") throw new Error("Only processed runs can be paid");
+  r.status = "Paid";
+  r.paidBy = actor || "Admin";
+  r.paidOn = today();
+  const ymd = r.month.replace("-", "");
+  r.payslips.forEach((p, i) => {
+    p.paidOn = r.paidOn;
+    const prefix =
+      p.paymentMethod === "Cash" ? "CASH" : p.paymentMethod === "UPI" ? "UPI" : "NEFT";
+    p.paymentRef = `${prefix}${ymd}${String(1000 + i)}`;
+  });
+  // Recover one installment of any outstanding salary advance from each paid
+  // employee, so the deduction shown on the payslip is reflected in the ledger.
+  staffData.recoverAdvancesForRun(r.payslips.map((p) => p.employeeId), r.id, r.month);
+  persistRuns();
+  return runListItem(r);
+}
+
+function deleteRun(id) {
+  const r = getRun(id);
+  if (r.status !== "Draft") throw new Error("Only draft runs can be deleted");
+  runs = runs.filter((x) => x.id !== id);
+  persistRuns();
+  return { ok: true };
+}
+
+function payslip(runId, employeeId) {
+  const r = getRun(runId);
+  const p = r.payslips.find((x) => x.employeeId === employeeId);
+  if (!p) throw new Error("Payslip not found");
+  return { ...p, runId: r.id, runStatus: r.status };
+}
+
+// Disbursement report grouped by payment method. Bank transfers carry bank +
+// account; UPI carries the VPA; cash is a simple list. Ready for the bank
+// portal upload (bank-transfer group) or cash/UPI reconciliation.
+function disbursementReport(runId) {
+  const r = getRun(runId);
+  const groups = {};
+  for (const p of r.payslips) {
+    const m = p.paymentMethod || "Bank Transfer";
+    if (!groups[m]) groups[m] = { method: m, count: 0, total: 0, lines: [] };
+    groups[m].count += 1;
+    groups[m].total += p.net;
+    groups[m].lines.push({
+      employeeId: p.employeeId,
+      name: p.name,
+      amount: p.net,
+      ref: p.paymentRef,
+      bank: p.bank,
+      account: p.account,
+      upiId: p.upiId,
+    });
+  }
+  return {
+    runId: r.id,
+    month: r.month,
+    status: r.status,
+    grandTotal: r.totals.net,
+    methods: Object.values(groups).sort((a, b) => b.total - a.total),
+  };
+}
+
+module.exports = Object.assign(api, {
+  roster,
+  summary,
+  RUN_STATUSES,
+  listRuns,
+  getRun,
+  createRun,
+  processRun,
+  payRun,
+  deleteRun,
+  payslip,
+  disbursementReport,
+});

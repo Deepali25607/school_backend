@@ -23,6 +23,57 @@ const VACCINES = [
   { code: "HPV", name: "HPV" },
   { code: "FLU", name: "Influenza (annual)" },
 ];
+
+// School-vaccination schedule. Each entry expresses *when* each dose for a
+// vaccine should be administered, in terms of the student's grade and an
+// optional gap-after-previous-dose window (in months). This mirrors the
+// kind of policy a school nurse follows from a public-health calendar.
+//
+// `requiredByGrade`: dose is overdue if the student is in this grade or
+//   later and the dose hasn't been recorded.
+// `gapMonths`: if set, the next dose can be scheduled only this many
+//   months after the previous dose was administered.
+// `annual`: true → a fresh dose is expected every academic year.
+const VACCINE_SCHEDULE = {
+  MMR: {
+    doses: [
+      { label: "Dose 1", requiredByGrade: 1 },
+      { label: "Dose 2", requiredByGrade: 5, gapMonths: 12 },
+    ],
+  },
+  TDAP: {
+    doses: [
+      { label: "Primary", requiredByGrade: 1 },
+      { label: "Booster", requiredByGrade: 7, gapMonths: 60 },
+    ],
+  },
+  HEPB: {
+    doses: [
+      { label: "Dose 1", requiredByGrade: 1 },
+      { label: "Dose 2", requiredByGrade: 1, gapMonths: 1 },
+      { label: "Dose 3", requiredByGrade: 1, gapMonths: 5 },
+    ],
+  },
+  VARI: {
+    doses: [{ label: "Dose 1", requiredByGrade: 1 }],
+  },
+  POLIO: {
+    doses: [
+      { label: "Dose 1", requiredByGrade: 1 },
+      { label: "Booster", requiredByGrade: 5, gapMonths: 48 },
+    ],
+  },
+  HPV: {
+    doses: [
+      { label: "Dose 1", requiredByGrade: 9 },
+      { label: "Dose 2", requiredByGrade: 9, gapMonths: 6 },
+    ],
+  },
+  FLU: {
+    annual: true,
+    doses: [{ label: "Annual", requiredByGrade: 1 }],
+  },
+};
 const VISIT_SEVERITIES = ["Routine", "Minor", "Moderate", "Urgent"];
 const COMMON_COMPLAINTS = [
   "Headache",
@@ -239,11 +290,245 @@ function summary() {
   };
 }
 
+// =========================================================================
+// VACCINATION SCHEDULE & COMPLIANCE
+// =========================================================================
+//
+// The seed `vaccinations` array on each profile used to be a flat
+// {code, taken, date} list — fine for "first dose given yes/no" but no good
+// for boosters, annual flu shots, or a real compliance dashboard. We keep
+// that shape for backwards compatibility but enrich it lazily: each
+// schedule lookup walks the profile's `doses[]` (an array of records keyed
+// by vaccine code + dose label) to determine status.
+
+function ensureDosesArray(profile) {
+  // Migration step: forward-fill `doses[]` from the legacy `vaccinations`
+  // list the first time we see a profile that doesn't have it. We DON'T
+  // back-fill every required dose — only the ones the legacy list says
+  // were taken — so newly defined doses still show as "due".
+  if (Array.isArray(profile.doses)) return;
+  profile.doses = (profile.vaccinations || [])
+    .filter((v) => v.taken)
+    .map((v) => ({
+      code: v.code,
+      label: "Dose 1",
+      date: v.date,
+      administeredBy: "Seed",
+    }));
+}
+
+function ageOf(student) {
+  // We don't store DOBs, so we proxy "age" off grade. Good enough to
+  // drive schedule rules expressed in grade terms.
+  return Number(student?.grade) || 0;
+}
+
+function monthsBetween(a, b) {
+  if (!a || !b) return Infinity;
+  const da = new Date(a);
+  const db = new Date(b);
+  return (
+    (db.getFullYear() - da.getFullYear()) * 12 +
+    (db.getMonth() - da.getMonth())
+  );
+}
+
+/**
+ * Build the per-dose status report for a single student.
+ * @returns {{
+ *   vaccines: Array<{
+ *     code, name, doses: Array<{
+ *       label, status: "done"|"due"|"overdue"|"not-yet",
+ *       requiredByGrade, gapMonths, administeredOn, administeredBy
+ *     }>
+ *   }>,
+ *   summary: { total, done, due, overdue, notYet, compliancePct }
+ * }}
+ */
+function vaccinationStatusFor(student, profile) {
+  ensureDosesArray(profile);
+  const today = new Date().toISOString().slice(0, 10);
+  const grade = ageOf(student);
+  const out = [];
+  let done = 0,
+    due = 0,
+    overdue = 0,
+    notYet = 0,
+    total = 0;
+
+  for (const vac of VACCINES) {
+    const sched = VACCINE_SCHEDULE[vac.code];
+    if (!sched) continue;
+    const studentDoses = profile.doses.filter((d) => d.code === vac.code);
+    // Sort administered doses by date so "previous dose" math is stable.
+    const administered = [...studentDoses].sort((a, b) =>
+      (a.date || "").localeCompare(b.date || "")
+    );
+
+    const doseStatuses = [];
+    for (let i = 0; i < sched.doses.length; i++) {
+      const spec = sched.doses[i];
+      const adm = administered[i] || null;
+      let status;
+      if (adm) {
+        status = "done";
+      } else if (grade < spec.requiredByGrade) {
+        status = "not-yet";
+      } else if (spec.gapMonths) {
+        // The previous dose must exist before THIS dose can be due. If the
+        // previous dose hasn't happened (or happened too recently), this
+        // dose is "due" but not "overdue".
+        const prev = administered[i - 1];
+        if (!prev) status = "due";
+        else {
+          const monthsSince = monthsBetween(prev.date, today);
+          status = monthsSince >= spec.gapMonths ? "overdue" : "due";
+        }
+      } else {
+        status = "overdue";
+      }
+
+      doseStatuses.push({
+        label: spec.label,
+        status,
+        requiredByGrade: spec.requiredByGrade,
+        gapMonths: spec.gapMonths || null,
+        administeredOn: adm?.date || null,
+        administeredBy: adm?.administeredBy || null,
+      });
+      total++;
+      if (status === "done") done++;
+      else if (status === "due") due++;
+      else if (status === "overdue") overdue++;
+      else if (status === "not-yet") notYet++;
+    }
+
+    out.push({
+      code: vac.code,
+      name: vac.name,
+      annual: !!sched.annual,
+      doses: doseStatuses,
+    });
+  }
+
+  const compliancePct =
+    total - notYet === 0
+      ? 100
+      : Math.round((done / (total - notYet)) * 100);
+
+  return {
+    vaccines: out,
+    summary: { total, done, due, overdue, notYet, compliancePct },
+  };
+}
+
+/**
+ * Record that a dose has been administered. The dose label must match one
+ * of the labels defined in VACCINE_SCHEDULE for the given vaccine code.
+ */
+function recordDose(studentId, payload) {
+  const profile = getProfile(studentId);
+  if (!profile) throw new Error("No health profile for that student");
+  ensureDosesArray(profile);
+  const { code, label, date, administeredBy } = payload || {};
+  if (!code || !VACCINES.find((v) => v.code === code))
+    throw new Error("Unknown vaccine code");
+  const sched = VACCINE_SCHEDULE[code];
+  const validLabels = (sched?.doses || []).map((d) => d.label);
+  if (!label || !validLabels.includes(label))
+    throw new Error(
+      `Dose label must be one of: ${validLabels.join(", ")}`
+    );
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date))
+    throw new Error("date must be YYYY-MM-DD");
+  // Reject duplicates: same code + label already recorded.
+  const dupe = profile.doses.find((d) => d.code === code && d.label === label);
+  if (dupe) {
+    // Permit overwriting an older date if explicitly newer — typical use
+    // case is "we logged the wrong date and want to fix it".
+    dupe.date = date;
+    dupe.administeredBy = administeredBy
+      ? String(administeredBy).slice(0, 80)
+      : dupe.administeredBy || null;
+  } else {
+    profile.doses.push({
+      code,
+      label,
+      date,
+      administeredBy: administeredBy
+        ? String(administeredBy).slice(0, 80)
+        : null,
+    });
+  }
+  // Also forward-fill the legacy vaccinations flag so the existing
+  // student-profile UI keeps showing "✓" without reaching for doses[].
+  const legacy = profile.vaccinations.find((v) => v.code === code);
+  if (legacy && !legacy.taken) {
+    legacy.taken = true;
+    legacy.date = date;
+  }
+  persistProfiles();
+  return profile;
+}
+
+/**
+ * Roster-wide compliance summary: counts per vaccine + per status. Used
+ * to drive the staff "compliance overview" cards.
+ */
+function vaccinationCompliance({ students } = {}) {
+  if (!Array.isArray(students)) return null;
+  const perVaccine = {};
+  for (const vac of VACCINES) {
+    perVaccine[vac.code] = {
+      code: vac.code,
+      name: vac.name,
+      done: 0,
+      due: 0,
+      overdue: 0,
+      notYet: 0,
+    };
+  }
+  let fullyCompliantStudents = 0;
+  let studentsWithOverdue = 0;
+  const overdueStudentIds = new Set();
+
+  for (const s of students) {
+    const profile = getProfile(s.id);
+    if (!profile) continue;
+    const status = vaccinationStatusFor(s, profile);
+    let hasOverdue = false;
+    let allDoneOrNotYet = true;
+    for (const v of status.vaccines) {
+      for (const d of v.doses) {
+        const bucket = perVaccine[v.code];
+        if (!bucket) continue;
+        bucket[d.status === "not-yet" ? "notYet" : d.status]++;
+        if (d.status === "overdue") {
+          hasOverdue = true;
+          overdueStudentIds.add(s.id);
+        }
+        if (d.status !== "done" && d.status !== "not-yet") allDoneOrNotYet = false;
+      }
+    }
+    if (allDoneOrNotYet) fullyCompliantStudents++;
+    if (hasOverdue) studentsWithOverdue++;
+  }
+
+  return {
+    totalStudents: students.length,
+    fullyCompliantStudents,
+    studentsWithOverdue,
+    perVaccine: Object.values(perVaccine),
+    overdueStudentIds: Array.from(overdueStudentIds),
+  };
+}
+
 module.exports = {
   BLOOD_GROUPS,
   COMMON_ALLERGIES,
   COMMON_CONDITIONS,
   VACCINES,
+  VACCINE_SCHEDULE,
   VISIT_SEVERITIES,
   COMMON_COMPLAINTS,
   profiles: () => profiles,
@@ -254,4 +539,8 @@ module.exports = {
   listVisits,
   addVisit,
   summary,
+  // vaccinations
+  vaccinationStatusFor,
+  vaccinationCompliance,
+  recordDose,
 };

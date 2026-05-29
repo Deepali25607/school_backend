@@ -53,6 +53,19 @@ function setScopeStudentId(userId, studentId) {
   });
 }
 
+function setLinkedStudentIds(userId, ids) {
+  const arr = Array.isArray(ids)
+    ? Array.from(new Set(ids.filter((p) => typeof p === "string"))).slice(0, 20)
+    : [];
+  return patchOverlay(userId, { linkedStudentIds: arr });
+}
+
+function setLinkedTeacherId(userId, teacherId) {
+  return patchOverlay(userId, {
+    linkedTeacherId: teacherId ? String(teacherId) : null,
+  });
+}
+
 module.exports = {
   getOverlay,
   patchOverlay,
@@ -60,4 +73,6 @@ module.exports = {
   setHiddenPaths,
   setHiddenWidgets,
   setScopeStudentId,
+  setLinkedStudentIds,
+  setLinkedTeacherId,
 };

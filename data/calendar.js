@@ -44,7 +44,12 @@ const TYPE_COLORS = {
   Leave: "amber",
 };
 
-function getEntries({ from, to } = {}) {
+// `scope` shape (all optional):
+//   { staff: bool, grades: Set<number> | null }
+// staff=true means the caller can see leave entries (admin/principal/hr/
+// accountant/teacher); grades, when present, narrows Exam entries to that
+// set of grade numbers (otherwise Exams are returned for every grade).
+function getEntries({ from, to, scope } = {}) {
   // Parse range (default = current month + next month to be useful)
   const fromTs = from ? new Date(from).getTime() : Date.now() - 30 * 86400000;
   const toTs = to ? new Date(to).getTime() : Date.now() + 60 * 86400000;
@@ -55,9 +60,12 @@ function getEntries({ from, to } = {}) {
     return !isNaN(t) && t >= fromTs && t <= toTs;
   };
 
+  const showStaff = !scope || scope.staff !== false;
+  const gradeFilter = scope?.grades || null;
+
   const out = [];
 
-  // -- Holidays --
+  // -- Holidays (everyone) --
   for (const h of HOLIDAYS) {
     if (!inRange(h.date)) continue;
     out.push({
@@ -71,7 +79,7 @@ function getEntries({ from, to } = {}) {
     });
   }
 
-  // -- Events --
+  // -- Events (everyone) --
   for (const e of eventsData.events()) {
     if (!inRange(e.date)) continue;
     out.push({
@@ -85,9 +93,10 @@ function getEntries({ from, to } = {}) {
     });
   }
 
-  // -- Exam papers (per paper, per grade) --
+  // -- Exam papers (narrowed by grade for student/parent callers) --
   for (const exam of examsData.exams) {
     if (exam.status === "Completed") continue;
+    if (gradeFilter && !gradeFilter.has(exam.grade)) continue;
     for (const paper of exam.papers) {
       if (!inRange(paper.date)) continue;
       out.push({
@@ -109,30 +118,33 @@ function getEntries({ from, to } = {}) {
     }
   }
 
-  // -- Approved leave (range entries) --
-  for (const l of leaveData.requests()) {
-    if (l.status !== "Approved") continue;
-    // Walk the range day-by-day so multi-day leaves show on every covered day
-    const start = new Date(l.fromDate);
-    const end = new Date(l.toDate);
-    if (isNaN(start) || isNaN(end)) continue;
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().slice(0, 10);
-      if (!inRange(dateStr)) continue;
-      out.push({
-        date: dateStr,
-        type: "Leave",
-        title: `${l.applicantName} · ${l.type}`,
-        sublabel: `${l.applicantType} · ${l.days} day${l.days === 1 ? "" : "s"} ${l.reason ? `· ${l.reason}` : ""}`,
-        link: `/app/leave`,
-        color: TYPE_COLORS.Leave,
-        meta: {
-          applicantId: l.applicantId,
-          applicantType: l.applicantType,
-          fromDate: l.fromDate,
-          toDate: l.toDate,
-        },
-      });
+  // -- Approved leave (range entries) — staff-only --
+  // Students and parents shouldn't see other people's leave (names + reasons).
+  if (showStaff) {
+    for (const l of leaveData.requests()) {
+      if (l.status !== "Approved") continue;
+      // Walk the range day-by-day so multi-day leaves show on every covered day
+      const start = new Date(l.fromDate);
+      const end = new Date(l.toDate);
+      if (isNaN(start) || isNaN(end)) continue;
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        const dateStr = d.toISOString().slice(0, 10);
+        if (!inRange(dateStr)) continue;
+        out.push({
+          date: dateStr,
+          type: "Leave",
+          title: `${l.applicantName} · ${l.type}`,
+          sublabel: `${l.applicantType} · ${l.days} day${l.days === 1 ? "" : "s"} ${l.reason ? `· ${l.reason}` : ""}`,
+          link: `/app/leave`,
+          color: TYPE_COLORS.Leave,
+          meta: {
+            applicantId: l.applicantId,
+            applicantType: l.applicantType,
+            fromDate: l.fromDate,
+            toDate: l.toDate,
+          },
+        });
+      }
     }
   }
 
@@ -146,8 +158,8 @@ function getEntries({ from, to } = {}) {
   return out;
 }
 
-function summary({ from, to } = {}) {
-  const entries = getEntries({ from, to });
+function summary({ from, to, scope } = {}) {
+  const entries = getEntries({ from, to, scope });
   const counts = { total: entries.length };
   for (const e of entries) counts[e.type] = (counts[e.type] || 0) + 1;
   // Next holiday / next exam — useful for the page header

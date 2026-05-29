@@ -14,6 +14,35 @@ const MAX = 500;
 
 const SEVERITIES = ["info", "success", "warning", "alert"];
 
+// Per-type audience class. Drives the /api/notifications scope filter:
+//   "all"    → every authed user can see it (broadcasts, events, generic)
+//   "staff"  → admin / principal / teacher / hr / accountant only
+//   "owners" → only users related to the notification.studentId
+//              (the student themselves, their linked parents, or teachers
+//              of their classes — staff with fullView still see it)
+const TYPE_AUDIENCE = {
+  "admissions.new": "staff",
+  "admissions.enrolled": "staff",
+  "admissions.rejected": "staff",
+  "maintenance.critical": "staff",
+  "maintenance.resolved": "staff",
+  "visitors.checkin": "staff",
+  "documents.requested": "owners",
+  "documents.issued": "owners",
+  "leave.applied": "staff",
+  "leave.decided": "staff",
+  "broadcasts.sent": "all",
+  "health.urgent": "owners",
+  "inventory.lowstock": "staff",
+  "discipline.major": "owners",
+  "discipline.escalated": "owners",
+  "achievement.added": "owners",
+  "events.added": "all",
+  "fees.recorded": "owners",
+  "fees.payment": "owners",
+  "fees.failed": "owners",
+};
+
 // type → { severity, icon, link, summarise(payload) } meta
 // (icon strings are lucide-react component names — the frontend looks them up)
 const TYPE_META = {
@@ -208,8 +237,14 @@ function seedNotif({ type, title, body, minutesAgo, statusLabel }) {
 }
 
 let items = store.load("notifications", buildSeed);
-// Sanity: ensure readBy is always an array (older saves may be missing it)
-items = items.map((n) => ({ ...n, readBy: Array.isArray(n.readBy) ? n.readBy : [] }));
+// Sanity: ensure readBy is always an array (older saves may be missing it),
+// and forward-fill audience + studentId so the visibility filter has data.
+items = items.map((n) => ({
+  ...n,
+  readBy: Array.isArray(n.readBy) ? n.readBy : [],
+  audience: n.audience || TYPE_AUDIENCE[n.type] || "all",
+  studentId: n.studentId || null,
+}));
 const persist = () => store.save("notifications", items);
 
 let nextSeq = items.length;
@@ -219,7 +254,7 @@ function nextId() {
 }
 
 /** Manually push a notification (used by background jobs / cron). */
-function record({ type, title, body, link, severity, icon }) {
+function record({ type, title, body, link, severity, icon, studentId }) {
   const meta = TYPE_META[type] || {};
   const n = {
     id: nextId(),
@@ -229,6 +264,8 @@ function record({ type, title, body, link, severity, icon }) {
     severity: severity || meta.severity || "info",
     icon: icon || meta.icon || "Bell",
     link: link || meta.link || null,
+    studentId: studentId || null,
+    audience: TYPE_AUDIENCE[type] || "all",
     ts: new Date().toISOString(),
     readBy: [],
   };
@@ -303,6 +340,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
       type: "documents.requested",
       title: `Requested · ${response?.type || "Document"}`,
       body: `For ${response?.studentId} · purpose: ${response?.purpose || "—"}`,
+      studentId: response?.studentId || null,
     });
   }
   // /api/documents/:id PATCH → notify on Issued/Rejected
@@ -313,6 +351,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "documents.issued",
         title: `Issued · ${response?.type}`,
         body: `${response?.certificateNo || ""} for ${response?.studentId}`,
+        studentId: response?.studentId || null,
       });
     }
     return null;
@@ -352,6 +391,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "health.urgent",
         title: `Urgent sickbay · ${response.studentId}`,
         body: `${response.complaint} · attended by ${response.attendedBy}`,
+        studentId: response.studentId || null,
       });
     }
     return null;
@@ -382,6 +422,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "discipline.major",
         title: `Major · ${response.studentId} · ${response.category}`,
         body: response.description,
+        studentId: response.studentId || null,
       });
     }
     return null;
@@ -394,12 +435,14 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "fees.payment",
         title: `${r.studentId} · ₹${(r.amount || 0).toLocaleString()}`,
         body: `${r.mode} · ${r.receiptNo || ""}`,
+        studentId: r.studentId || null,
       });
     } else if (r.status === "Failed") {
       return record({
         type: "fees.failed",
         title: `${r.studentId} · ₹${(r.amount || 0).toLocaleString()}`,
         body: `${r.mode} declined`,
+        studentId: r.studentId || null,
       });
     }
     return null;
@@ -411,6 +454,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "discipline.escalated",
         title: `Escalated · ${response?.studentId} · ${response?.category}`,
         body: response?.description || "",
+        studentId: response?.studentId || null,
       });
     }
     return null;
@@ -428,6 +472,7 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
         type: "achievement.added",
         title: `${r.position} · ${r.studentId} · ${r.category}`,
         body: `${r.event} (${r.level} level)`,
+        studentId: r.studentId || null,
       });
     }
     return null;
@@ -435,8 +480,30 @@ function recordFromEvent({ method, path, statusCode, body, user, response }) {
   return null;
 }
 
-function list({ userId, limit = 50, unread = false, type = "all" } = {}) {
+// Visibility check: given a notification and a caller's view (role +
+// allowedStudentIds Set), should this notification be shown?
+//   - role admin/principal/hr/accountant (fullView) → see everything
+//   - audience "all"    → everyone sees it
+//   - audience "staff"  → admin/principal/teacher/hr/accountant only
+//   - audience "owners" → only callers whose scope includes n.studentId
+function isVisibleTo(n, view) {
+  if (!view) return true;
+  if (view.fullView) return true;
+  const aud = n.audience || TYPE_AUDIENCE[n.type] || "all";
+  if (aud === "all") return true;
+  if (aud === "staff") {
+    return ["teacher", "hr", "accountant"].includes(view.role);
+  }
+  if (aud === "owners") {
+    if (!n.studentId) return false; // owners-audience with no student tag → hide
+    return view.studentIds?.has(n.studentId) || false;
+  }
+  return false;
+}
+
+function list({ userId, view, limit = 50, unread = false, type = "all" } = {}) {
   let res = items.slice();
+  if (view) res = res.filter((n) => isVisibleTo(n, view));
   if (type && type !== "all") res = res.filter((n) => n.type === type);
   if (unread && userId) res = res.filter((n) => !n.readBy.includes(userId));
   res = res.slice(0, Number(limit) || 50);
@@ -446,9 +513,11 @@ function list({ userId, limit = 50, unread = false, type = "all" } = {}) {
   return res;
 }
 
-function unreadCount(userId) {
+function unreadCount(userId, view) {
   if (!userId) return items.length;
-  return items.filter((n) => !n.readBy.includes(userId)).length;
+  return items.filter(
+    (n) => isVisibleTo(n, view) && !n.readBy.includes(userId)
+  ).length;
 }
 
 function markRead(id, userId) {

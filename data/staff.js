@@ -28,6 +28,10 @@ const STATUSES = ["Active", "On leave", "Resigned", "Probation"];
 
 const EMPLOYMENT_TYPES = ["Full-time", "Part-time", "Contract", "Intern"];
 
+// Payroll: how each staff member's salary is paid out (BRD 7.8 / 7.7).
+const PAYMENT_METHODS = ["Bank Transfer", "Cash", "UPI"];
+const BANKS = ["HDFC Bank", "ICICI Bank", "SBI", "Axis Bank", "Kotak Mahindra"];
+
 const DESIGNATIONS_BY_CATEGORY = {
   "Academic Support": ["Lab Assistant", "Librarian", "Sports Coach", "Music Teacher", "Special Educator"],
   Finance: ["Senior Accountant", "Junior Accountant", "Fee Collector", "Auditor"],
@@ -81,6 +85,51 @@ function seedDateAgo(years, months) {
   d.setFullYear(d.getFullYear() - years);
   d.setMonth(d.getMonth() - months);
   return d.toISOString().slice(0, 10);
+}
+
+// Build a full salary structure from a headline monthly salary. `base` tracks
+// the headline figure; allowances/deductions are derived with conventional
+// Indian-payroll ratios (HRA 40%, PF 12%, ESI for low earners, TDS slab).
+function buildPayrollFor(salary, i) {
+  const base = Math.max(0, Math.round(Number(salary) || 25000));
+  const hra = Math.round(base * 0.4);
+  const transport = 2400;
+  const special = Math.round(base * 0.1);
+  const overtime = i % 3 === 0 ? 2000 : 0;
+  const bonus = i % 5 === 0 ? 3000 : 0;
+  const pf = Math.round(base * 0.12);
+  const esi = base < 25000 ? Math.round((base + hra + transport + special) * 0.0075) : 0;
+  const tax = base > 50000 ? Math.round((base - 50000) * 0.1) : 0;
+  const loan = i % 7 === 0 ? 2500 : 0;
+  // Mostly bank transfers, with a realistic mix of UPI and cash for variety.
+  const method = i % 4 === 0 ? "UPI" : i % 9 === 0 ? "Cash" : "Bank Transfer";
+  const slug = String(i);
+  return {
+    paymentMethod: method,
+    bank: method === "Bank Transfer" ? BANKS[i % BANKS.length] : null,
+    account: method === "Bank Transfer" ? `XXXX${String(1000 + ((i * 91 + 7) % 8999)).slice(-4)}` : null,
+    upiId: method === "UPI" ? `pay${slug}${(hash("upi", i) % 9000) + 1000}@okicici` : null,
+    components: { base, hra, transport, special, overtime, bonus },
+    // `advance` is the monthly recovery of any outstanding salary advance; it is
+    // derived from the advances ledger (see below), not edited directly.
+    deductions: { pf, esi, tax, loan, advance: 0 },
+  };
+}
+
+function computePayroll(p) {
+  const c = p.components || {};
+  const d = p.deductions || {};
+  const gross =
+    (c.base || 0) + (c.hra || 0) + (c.transport || 0) + (c.special || 0) + (c.overtime || 0) + (c.bonus || 0);
+  const totalDeductions =
+    (d.pf || 0) + (d.esi || 0) + (d.tax || 0) + (d.loan || 0) + (d.advance || 0);
+  return { ...p, gross, totalDeductions, net: gross - totalDeductions };
+}
+
+function withPayroll(s) {
+  if (!s) return s;
+  if (!s.payroll) return { ...s, payroll: null };
+  return { ...s, payroll: { ...computePayroll(s.payroll), advances: advanceSummary(s.id) } };
 }
 
 function buildSeed() {
@@ -152,6 +201,7 @@ function buildSeed() {
         relation: ["Spouse", "Parent", "Sibling", "Friend"][hash("er", i) % 4],
         phone: `+91 9${(70000000 + hash("ecp", i) % 19999999).toString().slice(0, 9)}`,
       },
+      payroll: buildPayrollFor(row.salary, i),
       notes: null,
     };
   });
@@ -159,6 +209,16 @@ function buildSeed() {
 
 let items = store.load("staff", buildSeed);
 const persist = () => store.save("staff", items);
+
+// Backfill payroll for staff records seeded before payroll support existed.
+let _payrollBackfilled = false;
+items.forEach((s, i) => {
+  if (!s.payroll) {
+    s.payroll = buildPayrollFor(s.salary, i);
+    _payrollBackfilled = true;
+  }
+});
+if (_payrollBackfilled) persist();
 
 // ---- helpers ----
 
@@ -254,11 +314,12 @@ function list({ q, category, status, employmentType, sort = "name" } = {}) {
   else if (sort === "salary")
     out.sort((a, b) => (Number(b.salary) || 0) - (Number(a.salary) || 0));
   else out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
+  return out.map(withPayroll);
 }
 
 function get(id) {
-  return items.find((s) => s.id === id) || null;
+  const s = items.find((s) => s.id === id);
+  return s ? withPayroll(s) : null;
 }
 
 function summary() {
@@ -357,15 +418,344 @@ function remove(id) {
   return removed;
 }
 
+// ---- payroll maintenance (BRD 7.8) ----
+
+function sanitizeAmounts(obj, allowed) {
+  const out = {};
+  for (const k of allowed) {
+    if (obj[k] === undefined) continue;
+    const n = Number(obj[k]);
+    if (!Number.isFinite(n) || n < 0 || n > 10000000)
+      throw new Error(`${k} must be a number between 0 and 1,00,00,000`);
+    out[k] = Math.round(n);
+  }
+  return out;
+}
+
+const COMPONENT_FIELDS = ["base", "hra", "transport", "special", "overtime", "bonus"];
+const DEDUCTION_FIELDS = ["pf", "esi", "tax", "loan"];
+
+// Maintain ONE staff member's payroll. Editing `base` keeps the headline
+// `salary` field in sync so the directory card stays consistent.
+function updatePayroll(id, patch) {
+  const s = items.find((x) => x.id === id);
+  if (!s) throw new Error("Staff not found");
+  const p = s.payroll || buildPayrollFor(s.salary, 0);
+  if (patch.components) p.components = { ...p.components, ...sanitizeAmounts(patch.components, COMPONENT_FIELDS) };
+  if (patch.deductions) p.deductions = { ...p.deductions, ...sanitizeAmounts(patch.deductions, DEDUCTION_FIELDS) };
+  if (patch.paymentMethod !== undefined) {
+    if (!PAYMENT_METHODS.includes(patch.paymentMethod))
+      throw new Error(`paymentMethod must be one of ${PAYMENT_METHODS.join(", ")}`);
+    p.paymentMethod = patch.paymentMethod;
+  }
+  if (patch.bank !== undefined) p.bank = patch.bank || null;
+  if (patch.account !== undefined) p.account = patch.account ? String(patch.account).trim() : null;
+  if (patch.upiId !== undefined) p.upiId = patch.upiId ? String(patch.upiId).trim() : null;
+  s.payroll = p;
+  s.salary = p.components.base;
+  persist();
+  return withPayroll(s);
+}
+
+// Maintain payroll for MANY staff at once (BRD: mass payroll feature).
+// actions: raisePercent (value=%), setBonus (value=₹), setMethod (value=method).
+function bulkUpdatePayroll({ ids, category, action, value }) {
+  const targets = items.filter((s) => {
+    if (Array.isArray(ids) && ids.length) return ids.includes(s.id);
+    if (category && category !== "all") return s.category === category;
+    return true;
+  });
+  if (targets.length === 0) throw new Error("No staff matched the selection");
+  for (const s of targets) {
+    if (!s.payroll) s.payroll = buildPayrollFor(s.salary, 0);
+    const p = s.payroll;
+    if (action === "raisePercent") {
+      const pct = Number(value);
+      if (!Number.isFinite(pct) || pct < -100 || pct > 200)
+        throw new Error("Increment % must be between -100 and 200");
+      p.components.base = Math.round(p.components.base * (1 + pct / 100));
+      p.components.hra = Math.round(p.components.base * 0.4);
+      p.components.special = Math.round(p.components.base * 0.1);
+      p.deductions.pf = Math.round(p.components.base * 0.12);
+      s.salary = p.components.base;
+    } else if (action === "setBonus") {
+      const b = Number(value);
+      if (!Number.isFinite(b) || b < 0) throw new Error("Bonus must be a non-negative number");
+      p.components.bonus = Math.round(b);
+    } else if (action === "setMethod") {
+      if (!PAYMENT_METHODS.includes(value))
+        throw new Error(`method must be one of ${PAYMENT_METHODS.join(", ")}`);
+      p.paymentMethod = value;
+    } else {
+      throw new Error("Unknown bulk action");
+    }
+  }
+  persist();
+  return { updated: targets.length, action };
+}
+
+// ---- salary advances (BRD 7.8) ----
+// A salary advance is a lump sum paid out to a staff member and recovered from
+// future payroll runs in equal monthly installments. The recovery installment
+// shows up as the `advance` deduction on the payslip; once fully recovered the
+// advance is marked Cleared and the deduction drops to zero automatically.
+
+const ADVANCE_STATUSES = ["Active", "Cleared", "Cancelled"];
+
+let advances = store.load("staff-advances", () => []);
+const persistAdvances = () => store.save("staff-advances", advances);
+
+function nextAdvanceId() {
+  let max = 0;
+  for (const a of advances) {
+    const n = parseInt(String(a.id).replace(/\D+/g, ""), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `ADV${String(max + 1).padStart(4, "0")}`;
+}
+
+const advanceBalance = (a) => Math.max(0, (a.amount || 0) - (a.recovered || 0));
+
+// Total recovery to deduct this month across a staff member's active advances.
+function advanceMonthlyRecovery(staffId) {
+  return advances
+    .filter((a) => a.staffId === staffId && a.status === "Active")
+    .reduce((sum, a) => sum + Math.min(a.perInstallment, advanceBalance(a)), 0);
+}
+
+// Compact summary attached to each staff payroll record for the UI.
+function advanceSummary(staffId) {
+  const active = advances.filter((a) => a.staffId === staffId && a.status === "Active");
+  return {
+    outstanding: active.reduce((s, a) => s + advanceBalance(a), 0),
+    monthly: advanceMonthlyRecovery(staffId),
+    activeCount: active.length,
+  };
+}
+
+// Re-derive the `advance` deduction on a staff member's payroll from the ledger.
+function syncStaffAdvanceDeduction(staffId) {
+  const s = items.find((x) => x.id === staffId);
+  if (!s) return;
+  if (!s.payroll) s.payroll = buildPayrollFor(s.salary, 0);
+  s.payroll.deductions.advance = advanceMonthlyRecovery(staffId);
+}
+
+// Filterable advances list for the dedicated Salary Advances page. Each item
+// is joined to its staff record (role / department / avatar) so the page can
+// filter by department and render rich rows.
+function listAdvances({ staffId, status, q, category, sort = "recent" } = {}) {
+  const byId = new Map(items.map((s) => [s.id, s]));
+  let out = advances.map((a) => {
+    const s = byId.get(a.staffId);
+    return {
+      ...a,
+      balance: advanceBalance(a),
+      role: s ? s.designation : null,
+      department: s ? s.category : null,
+      avatar: s ? s.avatar : avatarFromName(a.staffName),
+    };
+  });
+  if (staffId) out = out.filter((a) => a.staffId === staffId);
+  if (status && status !== "all") out = out.filter((a) => a.status === status);
+  if (category && category !== "all") out = out.filter((a) => a.department === category);
+  if (q) {
+    const t = String(q).toLowerCase();
+    out = out.filter(
+      (a) =>
+        (a.staffName || "").toLowerCase().includes(t) ||
+        (a.staffId || "").toLowerCase().includes(t) ||
+        (a.id || "").toLowerCase().includes(t) ||
+        (a.reason || "").toLowerCase().includes(t)
+    );
+  }
+  if (sort === "outstanding") out.sort((a, b) => b.balance - a.balance);
+  else if (sort === "amount") out.sort((a, b) => b.amount - a.amount);
+  else if (sort === "name") out.sort((a, b) => (a.staffName || "").localeCompare(b.staffName || ""));
+  else
+    out.sort((a, b) =>
+      a.grantedOn === b.grantedOn ? (a.id < b.id ? 1 : -1) : a.grantedOn < b.grantedOn ? 1 : -1
+    );
+  return out;
+}
+
+// Roll-up totals for the Salary Advances page KPI cards.
+function advancesOverview() {
+  const active = advances.filter((a) => a.status === "Active");
+  return {
+    total: advances.length,
+    activeCount: active.length,
+    clearedCount: advances.filter((a) => a.status === "Cleared").length,
+    cancelledCount: advances.filter((a) => a.status === "Cancelled").length,
+    outstanding: active.reduce((s, a) => s + advanceBalance(a), 0),
+    monthlyRecovery: active.reduce((s, a) => s + Math.min(a.perInstallment, advanceBalance(a)), 0),
+    disbursed: advances
+      .filter((a) => a.status !== "Cancelled")
+      .reduce((s, a) => s + (a.amount || 0), 0),
+    recovered: advances.reduce((s, a) => s + (a.recovered || 0), 0),
+  };
+}
+
+function grantAdvance(payload, actor) {
+  const { staffId, amount, installments, reason, disbursementMethod } = payload || {};
+  const s = items.find((x) => x.id === staffId);
+  if (!s) throw new Error("Staff not found");
+  const amt = Math.round(Number(amount));
+  if (!Number.isFinite(amt) || amt <= 0 || amt > 10000000)
+    throw new Error("amount must be between 1 and 1,00,00,000");
+  const inst = Math.round(Number(installments));
+  if (!Number.isFinite(inst) || inst < 1 || inst > 60)
+    throw new Error("installments must be between 1 and 60");
+  const method = disbursementMethod || s.payroll?.paymentMethod || "Bank Transfer";
+  if (!PAYMENT_METHODS.includes(method))
+    throw new Error(`disbursementMethod must be one of ${PAYMENT_METHODS.join(", ")}`);
+  // Guard against over-lending: total outstanding shouldn't exceed 6x net pay.
+  const net = s.payroll ? computePayroll(s.payroll).net : Number(s.salary) || 0;
+  const outstanding = advanceSummary(staffId).outstanding;
+  if (net > 0 && outstanding + amt > net * 6)
+    throw new Error("Total outstanding advance would exceed 6× monthly net pay");
+  const rec = {
+    id: nextAdvanceId(),
+    staffId: s.id,
+    staffName: s.name,
+    amount: amt,
+    installments: inst,
+    perInstallment: Math.ceil(amt / inst),
+    recovered: 0,
+    reason: reason ? String(reason).trim().slice(0, 200) : null,
+    disbursementMethod: method,
+    status: "Active",
+    grantedOn: new Date().toISOString().slice(0, 10),
+    grantedBy: actor?.name || "Admin",
+    recoveries: [],
+  };
+  advances.unshift(rec);
+  persistAdvances();
+  syncStaffAdvanceDeduction(s.id);
+  persist();
+  return { ...rec, balance: advanceBalance(rec) };
+}
+
+function cancelAdvance(id) {
+  const a = advances.find((x) => x.id === id);
+  if (!a) throw new Error("Advance not found");
+  if (a.status !== "Active") throw new Error("Only active advances can be cancelled");
+  a.status = "Cancelled";
+  a.closedOn = new Date().toISOString().slice(0, 10);
+  persistAdvances();
+  syncStaffAdvanceDeduction(a.staffId);
+  persist();
+  return { ...a, balance: advanceBalance(a) };
+}
+
+// Recover one installment from every active advance when a run is paid. Called
+// by payroll.payRun with the run's employee ids.
+function recoverAdvancesForRun(staffIds, runId, month) {
+  const ids = new Set(staffIds);
+  const day = new Date().toISOString().slice(0, 10);
+  let touched = false;
+  for (const a of advances) {
+    if (a.status !== "Active" || !ids.has(a.staffId)) continue;
+    const bal = advanceBalance(a);
+    if (bal <= 0) {
+      a.status = "Cleared";
+      a.closedOn = day;
+      touched = true;
+      continue;
+    }
+    const take = Math.min(a.perInstallment, bal);
+    a.recovered += take;
+    a.recoveries.push({ date: day, amount: take, runId, month });
+    if (advanceBalance(a) <= 0) {
+      a.status = "Cleared";
+      a.closedOn = day;
+    }
+    touched = true;
+  }
+  if (touched) {
+    persistAdvances();
+    for (const staffId of ids) syncStaffAdvanceDeduction(staffId);
+    persist();
+  }
+}
+
+function payrollSummary() {
+  const list = items.filter((s) => s.payroll).map((s) => computePayroll(s.payroll));
+  const gross = list.reduce((a, p) => a + p.gross, 0);
+  const deductions = list.reduce((a, p) => a + p.totalDeductions, 0);
+  const net = list.reduce((a, p) => a + p.net, 0);
+  const byMethod = {};
+  for (const m of PAYMENT_METHODS) byMethod[m] = list.filter((p) => p.paymentMethod === m).length;
+  const advancesOutstanding = advances
+    .filter((a) => a.status === "Active")
+    .reduce((s, a) => s + advanceBalance(a), 0);
+  return {
+    headcount: list.length,
+    gross,
+    deductions,
+    net,
+    avg: list.length ? Math.round(net / list.length) : 0,
+    byMethod,
+    advancesOutstanding,
+  };
+}
+
+// Roster shaped for the payroll module / page.
+function payrollRoster() {
+  const now = Date.now();
+  return list({ sort: "name" })
+    .filter((s) => s.payroll)
+    .map((s) => {
+      const yos = s.joinedOn
+        ? Math.max(0, Math.floor((now - new Date(s.joinedOn).getTime()) / (365 * 86400000)))
+        : 0;
+      return {
+        id: s.id,
+        name: s.name,
+        avatar: s.avatar,
+        role: s.designation,
+        department: s.category,
+        status: s.status,
+        joinedOn: s.joinedOn,
+        yearsOfService: yos,
+        paymentMethod: s.payroll.paymentMethod,
+        bank: s.payroll.bank,
+        account: s.payroll.account,
+        upiId: s.payroll.upiId || null,
+        components: s.payroll.components,
+        deductions: s.payroll.deductions,
+        gross: s.payroll.gross,
+        totalDeductions: s.payroll.totalDeductions,
+        net: s.payroll.net,
+        advances: s.payroll.advances || advanceSummary(s.id),
+      };
+    });
+}
+
 module.exports = {
   CATEGORIES,
   STATUSES,
   EMPLOYMENT_TYPES,
   DESIGNATIONS_BY_CATEGORY,
+  PAYMENT_METHODS,
+  BANKS,
   list,
   get,
   add,
   update,
   remove,
   summary,
+  // payroll
+  updatePayroll,
+  bulkUpdatePayroll,
+  payrollSummary,
+  payrollRoster,
+  // salary advances
+  ADVANCE_STATUSES,
+  listAdvances,
+  advancesOverview,
+  grantAdvance,
+  cancelAdvance,
+  recoverAdvancesForRun,
+  advanceSummary,
 };

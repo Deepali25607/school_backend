@@ -105,12 +105,15 @@ function eventTypeFor(path, method) {
   if (path.startsWith("/api/communications")) return "broadcasts.changed";
   if (path.startsWith("/api/events")) return "events.changed";
   if (path.startsWith("/api/inventory")) return "inventory.changed";
+  if (path.startsWith("/api/expenses")) return "expenses.changed";
   if (path.startsWith("/api/leave")) return "leave.changed";
   if (path.startsWith("/api/maintenance")) return "maintenance.changed";
   if (path.startsWith("/api/visitors")) return "visitors.changed";
   if (path.startsWith("/api/documents")) return "documents.changed";
   if (path.startsWith("/api/health")) return "health.changed";
   if (path.startsWith("/api/discipline")) return "discipline.changed";
+  if (path.startsWith("/api/safe-reports")) return "safe-reports.changed";
+  if (path.startsWith("/api/quizzes")) return "quizzes.changed";
   if (path.startsWith("/api/achievements")) return "achievements.changed";
   if (path.startsWith("/api/cafeteria")) return "cafeteria.changed";
   if (path.startsWith("/api/alumni")) return "alumni.changed";
@@ -127,6 +130,8 @@ function eventTypeFor(path, method) {
   if (path.startsWith("/api/substitutes")) return "substitutes.changed";
   if (path.startsWith("/api/staff")) return "staff.changed";
   if (path.startsWith("/api/users")) return "users.changed";
+  if (path.startsWith("/api/assignments")) return "assignments.changed";
+  if (path.startsWith("/api/messages")) return "messages.changed";
   if (path.startsWith("/api/reports")) return null;
   return null;
 }

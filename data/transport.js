@@ -348,6 +348,75 @@ function summary() {
   };
 }
 
+// ---- per-student assignment ----
+// A student's bus assignment is stored on the student record as
+// { routeId, stopName } (set manually when enrolling/editing the student) and
+// resolved here into a rich object for display. Legacy seeded students that
+// predate this field have NO `transport` property; for them we fall back to a
+// deterministic derivation from the id so their profile isn't suddenly blank.
+function hashStr(str) {
+  let h = 2166136261 >>> 0;
+  const s = String(str);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function shapeAssignment(route, stop, pickups) {
+  return {
+    routeId: route.id,
+    routeName: route.name,
+    color: route.color,
+    status: route.status,
+    bus: {
+      id: route.bus?.id || null,
+      plate: route.bus?.plate || null,
+      driver: route.bus?.driver || null,
+      helper: route.bus?.helper || null,
+      capacity: route.bus?.capacity || null,
+    },
+    stop: {
+      name: stop.name,
+      eta: stop.eta,
+      order: route.stops.indexOf(stop) + 1,
+    },
+    totalStops: pickups.length,
+  };
+}
+
+// Resolve a stored { routeId, stopName } into the display object. Returns null
+// if the route was since deleted or has no pickup stops.
+function resolveAssignment(routeId, stopName) {
+  const route = routes.find((r) => r.id === routeId);
+  if (!route) return null;
+  const pickups = route.stops.filter((s) => !s.school);
+  if (pickups.length === 0) return null;
+  const stop = pickups.find((s) => s.name === stopName) || pickups[0];
+  return shapeAssignment(route, stop, pickups);
+}
+
+function studentAssignment(student, opts = {}) {
+  if (!student || !student.id) return null;
+  // Explicit, manually-set assignment takes priority.
+  if (student.transport !== undefined) {
+    if (!student.transport || !student.transport.routeId) return null;
+    return resolveAssignment(student.transport.routeId, student.transport.stopName);
+  }
+  // Legacy seeded students (no transport field): derive deterministically.
+  // Boarders and ~30% of the rest are treated as non-transport.
+  if (opts.isResident) return null;
+  const h = hashStr(student.id);
+  if (h % 10 < 3) return null;
+  if (routes.length === 0) return null;
+  const route = routes[h % routes.length];
+  const pickups = route.stops.filter((s) => !s.school);
+  if (pickups.length === 0) return null;
+  const stop = pickups[(h >>> 4) % pickups.length];
+  return shapeAssignment(route, stop, pickups);
+}
+
 module.exports = {
   get routes() { return routes; },
   PALETTE,
@@ -361,4 +430,6 @@ module.exports = {
   updateStop,
   removeStop,
   summary,
+  studentAssignment,
+  resolveAssignment,
 };

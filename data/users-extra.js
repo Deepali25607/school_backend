@@ -109,6 +109,18 @@ function update(id, patch) {
       ? patch.hiddenWidgets.filter((p) => typeof p === "string").slice(0, 200)
       : [];
   }
+  if (patch.linkedStudentIds !== undefined) {
+    u.linkedStudentIds = Array.isArray(patch.linkedStudentIds)
+      ? Array.from(
+          new Set(patch.linkedStudentIds.filter((p) => typeof p === "string"))
+        ).slice(0, 20)
+      : [];
+  }
+  if (patch.linkedTeacherId !== undefined) {
+    u.linkedTeacherId = patch.linkedTeacherId
+      ? String(patch.linkedTeacherId)
+      : null;
+  }
   if (patch.scopeStudentId !== undefined) {
     u.scopeStudentId = patch.scopeStudentId
       ? String(patch.scopeStudentId)
@@ -116,6 +128,7 @@ function update(id, patch) {
   }
   if (patch.sourceType !== undefined) u.sourceType = patch.sourceType || null;
   if (patch.sourceId !== undefined) u.sourceId = patch.sourceId || null;
+  if (patch.twoFactor !== undefined) u.twoFactor = patch.twoFactor || null;
   persist();
   return u;
 }

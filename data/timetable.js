@@ -83,6 +83,69 @@ function buildGrid(grade, section) {
   }));
 }
 
+const SECTIONS = ["A", "B", "C", "D"];
+
+// Resolve the effective cell (subject/teacher/room) for one slot of one class.
+function cellAt(grade, section, day, period) {
+  const dayRow = buildGrid(grade, section).find((d) => d.day === day);
+  if (!dayRow) return null;
+  return dayRow.periods.find((p) => p.p === period) || null;
+}
+
+// Detect teacher / room double-bookings for a hypothetical assignment at a
+// given day+period, scanning every other class. `teacherId` / `room` are the
+// values being checked; pass the values you're about to assign. BRD 7.9.
+function findClashes({ grade, section, day, period, teacherId, room }) {
+  const teacherClashes = [];
+  const roomClashes = [];
+  for (let g = 1; g <= 12; g++) {
+    for (const s of SECTIONS) {
+      if (g === grade && s === section) continue;
+      const cell = cellAt(g, s, day, period);
+      if (!cell) continue;
+      if (teacherId && cell.teacherId === teacherId)
+        teacherClashes.push({ grade: g, section: s, subject: cell.subject, room: cell.room });
+      if (room && cell.room === room)
+        roomClashes.push({ grade: g, section: s, subject: cell.subject, teacherId: cell.teacherId });
+    }
+  }
+  return { teacherClashes, roomClashes };
+}
+
+// Conflicts arising from manual overrides — the cells an admin has actually
+// edited. The deterministic base grid deliberately reuses a small teacher pool,
+// so only overridden cells produce actionable conflict reports.
+function conflictsReport() {
+  const report = [];
+  for (const ov of listOverrides()) {
+    const { grade, section, day, period } = ov;
+    const cell = cellAt(grade, section, day, period);
+    if (!cell) continue;
+    const { teacherClashes, roomClashes } = findClashes({
+      grade,
+      section,
+      day,
+      period,
+      teacherId: cell.teacherId,
+      room: cell.room,
+    });
+    if (teacherClashes.length || roomClashes.length) {
+      report.push({
+        grade,
+        section,
+        day,
+        period,
+        subject: cell.subject,
+        teacherId: cell.teacherId,
+        room: cell.room,
+        teacherClashes,
+        roomClashes,
+      });
+    }
+  }
+  return report;
+}
+
 function setOverride(grade, section, day, period, patch) {
   if (!DAYS.includes(day)) throw new Error("Invalid day");
   if (!Number.isInteger(grade) || grade < 1 || grade > 12)
@@ -107,7 +170,13 @@ function setOverride(grade, section, day, period, patch) {
   }
   persistOverrides();
   notifyChange();
-  return next;
+  // Surface any double-bookings the new effective cell introduces so the UI
+  // can warn the user (advisory — the assignment is still saved).
+  const cell = cellAt(grade, section, day, period);
+  const conflicts = cell
+    ? findClashes({ grade, section, day, period, teacherId: cell.teacherId, room: cell.room })
+    : { teacherClashes: [], roomClashes: [] };
+  return { override: next, conflicts };
 }
 
 function clearOverride(grade, section, day, period) {
@@ -160,5 +229,8 @@ module.exports = {
   clearOverride,
   clearClass,
   listOverrides,
+  findClashes,
+  conflictsReport,
+  cellAt,
   onChange,
 };

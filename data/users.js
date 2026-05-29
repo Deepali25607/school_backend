@@ -44,9 +44,12 @@ function applyOverlay(u) {
     avatar: ov.avatar || u.avatar,
     photoUrl: ov.photoUrl || u.photoUrl || null,
     passwordHash: ov.passwordHash || u.passwordHash,
+    twoFactor: ov.twoFactor || u.twoFactor || null,
     permissions: {
-      hiddenPaths:   Array.isArray(ov.hiddenPaths)   ? ov.hiddenPaths   : [],
-      hiddenWidgets: Array.isArray(ov.hiddenWidgets) ? ov.hiddenWidgets : [],
+      hiddenPaths:      Array.isArray(ov.hiddenPaths)      ? ov.hiddenPaths      : [],
+      hiddenWidgets:    Array.isArray(ov.hiddenWidgets)    ? ov.hiddenWidgets    : [],
+      linkedStudentIds: Array.isArray(ov.linkedStudentIds) ? ov.linkedStudentIds : [],
+      linkedTeacherId:  ov.linkedTeacherId || u.linkedTeacherId || null,
     },
     scopeStudentId: ov.scopeStudentId || u.scopeStudentId || null,
   };
@@ -57,13 +60,15 @@ function applyOverlay(u) {
 function combined() {
   const seedView = seedUsers.map((u) => applyOverlay(u));
   const extraView = usersExtra.all().map((u) => {
-    const { hiddenPaths, hiddenWidgets, ...rest } = u;
+    const { hiddenPaths, hiddenWidgets, linkedStudentIds, linkedTeacherId, ...rest } = u;
     return {
       ...rest,
       source: "admin",
       permissions: {
-        hiddenPaths:   Array.isArray(hiddenPaths)   ? hiddenPaths   : [],
-        hiddenWidgets: Array.isArray(hiddenWidgets) ? hiddenWidgets : [],
+        hiddenPaths:      Array.isArray(hiddenPaths)      ? hiddenPaths      : [],
+        hiddenWidgets:    Array.isArray(hiddenWidgets)    ? hiddenWidgets    : [],
+        linkedStudentIds: Array.isArray(linkedStudentIds) ? linkedStudentIds : [],
+        linkedTeacherId:  linkedTeacherId || null,
       },
     };
   });
@@ -92,20 +97,68 @@ const usersProxy = new Proxy(
 );
 
 function publicUser(u) {
-  // strip the hash before sending to client
-  const { passwordHash, ...safe } = u;
+  // strip the hash + raw 2FA secret before sending to client
+  const { passwordHash, twoFactor, ...safe } = u;
+  safe.twoFactorEnabled = !!(twoFactor && twoFactor.enabled);
+  safe.twoFactorPending = !!(twoFactor && twoFactor.pending && !twoFactor.enabled);
   return safe;
+}
+
+// ---------- two-factor authentication (TOTP) ----------
+
+function setTwoFactor(userId, tf) {
+  if (usersExtra.isExtra(userId)) usersExtra.update(userId, { twoFactor: tf });
+  else userPrefs.patchOverlay(userId, { twoFactor: tf });
+}
+
+// Begin enrolment: store the secret as `pending` (not yet active). The user
+// must confirm a code from their authenticator before it is enabled.
+function startTwoFactorSetup(userId, secret) {
+  const u = findById(userId);
+  if (!u) throw new Error("User not found");
+  setTwoFactor(userId, { enabled: false, secret: null, pending: secret });
+  return true;
+}
+
+function enableTwoFactor(userId) {
+  const u = findById(userId);
+  if (!u) throw new Error("User not found");
+  const pending = u.twoFactor?.pending;
+  if (!pending) throw new Error("No pending 2FA setup — start setup first");
+  setTwoFactor(userId, { enabled: true, secret: pending, pending: null });
+  return true;
+}
+
+function disableTwoFactor(userId) {
+  const u = findById(userId);
+  if (!u) throw new Error("User not found");
+  setTwoFactor(userId, { enabled: false, secret: null, pending: null });
+  return true;
+}
+
+// Returns the active secret for login verification, or the pending secret for
+// enrolment confirmation. Internal use only — never sent to the client.
+function getTwoFactorSecret(userId, { pending = false } = {}) {
+  const u = findById(userId);
+  if (!u || !u.twoFactor) return null;
+  return pending ? u.twoFactor.pending : u.twoFactor.secret;
+}
+
+function isTwoFactorEnabled(user) {
+  return !!(user && user.twoFactor && user.twoFactor.enabled);
 }
 
 function wrapExtra(u) {
   if (!u) return null;
-  const { hiddenPaths, hiddenWidgets, ...rest } = u;
+  const { hiddenPaths, hiddenWidgets, linkedStudentIds, linkedTeacherId, ...rest } = u;
   return {
     ...rest,
     source: "admin",
     permissions: {
-      hiddenPaths:   Array.isArray(hiddenPaths)   ? hiddenPaths   : [],
-      hiddenWidgets: Array.isArray(hiddenWidgets) ? hiddenWidgets : [],
+      hiddenPaths:      Array.isArray(hiddenPaths)      ? hiddenPaths      : [],
+      hiddenWidgets:    Array.isArray(hiddenWidgets)    ? hiddenWidgets    : [],
+      linkedStudentIds: Array.isArray(linkedStudentIds) ? linkedStudentIds : [],
+      linkedTeacherId:  linkedTeacherId || null,
     },
   };
 }
@@ -261,7 +314,14 @@ function adminResetPassword(id, newPassword) {
   return true;
 }
 
-function adminSetPermissions(id, hiddenPaths, scopeStudentId, hiddenWidgets) {
+function adminSetPermissions(
+  id,
+  hiddenPaths,
+  scopeStudentId,
+  hiddenWidgets,
+  linkedStudentIds,
+  linkedTeacherId
+) {
   const user = findById(id);
   if (!user) throw new Error("User not found");
   const cleanedPaths = Array.isArray(hiddenPaths)
@@ -270,18 +330,29 @@ function adminSetPermissions(id, hiddenPaths, scopeStudentId, hiddenWidgets) {
   const cleanedWidgets = Array.isArray(hiddenWidgets)
     ? hiddenWidgets.filter((p) => typeof p === "string").slice(0, 200)
     : null;
+  const cleanedLinks = Array.isArray(linkedStudentIds)
+    ? Array.from(
+        new Set(linkedStudentIds.filter((p) => typeof p === "string"))
+      ).slice(0, 20)
+    : null;
   if (usersExtra.isExtra(id)) {
     const patch = {};
     if (cleanedPaths) patch.hiddenPaths = cleanedPaths;
     if (cleanedWidgets) patch.hiddenWidgets = cleanedWidgets;
+    if (cleanedLinks) patch.linkedStudentIds = cleanedLinks;
     if (scopeStudentId !== undefined)
       patch.scopeStudentId = scopeStudentId || null;
+    if (linkedTeacherId !== undefined)
+      patch.linkedTeacherId = linkedTeacherId || null;
     if (Object.keys(patch).length) usersExtra.update(id, patch);
   } else {
     if (cleanedPaths) userPrefs.setHiddenPaths(id, cleanedPaths);
     if (cleanedWidgets) userPrefs.setHiddenWidgets(id, cleanedWidgets);
+    if (cleanedLinks) userPrefs.setLinkedStudentIds(id, cleanedLinks);
     if (scopeStudentId !== undefined)
       userPrefs.setScopeStudentId(id, scopeStudentId || null);
+    if (linkedTeacherId !== undefined)
+      userPrefs.setLinkedTeacherId(id, linkedTeacherId || null);
   }
   return findById(id);
 }
@@ -302,6 +373,12 @@ module.exports = {
   updateProfile,
   changePassword,
   isValidRole,
+  // two-factor
+  startTwoFactorSetup,
+  enableTwoFactor,
+  disableTwoFactor,
+  getTwoFactorSecret,
+  isTwoFactorEnabled,
   // admin ops
   listAll,
   adminCreate,

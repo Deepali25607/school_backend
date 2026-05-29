@@ -313,11 +313,28 @@ function decorateCampaign(c) {
   };
 }
 
+// Strip PII fields from anonymous donations before they leave the server.
+// The donor explicitly chose anonymity at donation time — spreading the raw
+// record would leak `donorName`, `alumnusId`, `panNo`, etc. even though
+// `donorLabel` says "Anonymous donor".
 function decorateDonation(d) {
   let label, sublabel;
   if (d.anonymous) {
     label = "Anonymous donor";
     sublabel = null;
+    return {
+      id: d.id,
+      campaignId: d.campaignId,
+      amount: d.amount,
+      status: d.status,
+      donatedAt: d.donatedAt,
+      paymentMode: d.paymentMode,
+      message: d.message || null,
+      anonymous: true,
+      donorLabel: label,
+      donorSublabel: sublabel,
+      isAlumni: false,
+    };
   } else if (d.alumnusId) {
     const a = alumniData.get(d.alumnusId);
     label = a ? a.name : d.donorName || "Alumnus";

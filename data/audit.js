@@ -41,13 +41,32 @@ function shouldSkip(path, method) {
   return false;
 }
 
-function list({ q = "", method = "all", role = "all", status = "all" } = {}) {
+function list({
+  q = "",
+  method = "all",
+  role = "all",
+  status = "all",
+  userId = "",
+  dateFrom = "",
+  dateTo = "",
+} = {}) {
   let out = entries;
   if (method !== "all") out = out.filter((e) => e.method === method);
   if (role !== "all") out = out.filter((e) => e.role === role);
+  if (userId) out = out.filter((e) => e.userId === userId);
   if (status !== "all") {
     if (status === "ok") out = out.filter((e) => e.status >= 200 && e.status < 300);
     else if (status === "error") out = out.filter((e) => e.status >= 400);
+  }
+  // Date filters: from/to accept YYYY-MM-DD. `to` is inclusive of the whole day.
+  if (dateFrom) {
+    const t = Date.parse(dateFrom);
+    if (!Number.isNaN(t)) out = out.filter((e) => Date.parse(e.at) >= t);
+  }
+  if (dateTo) {
+    // bump to end-of-day so "to=2026-05-26" includes entries from that day
+    const t = Date.parse(dateTo + "T23:59:59.999Z");
+    if (!Number.isNaN(t)) out = out.filter((e) => Date.parse(e.at) <= t);
   }
   if (q) {
     const t = String(q).toLowerCase();
@@ -55,10 +74,30 @@ function list({ q = "", method = "all", role = "all", status = "all" } = {}) {
       (e) =>
         e.path.toLowerCase().includes(t) ||
         (e.userName || "").toLowerCase().includes(t) ||
-        (e.summary || "").toLowerCase().includes(t)
+        (e.summary && JSON.stringify(e.summary).toLowerCase().includes(t))
     );
   }
   return out;
+}
+
+/**
+ * Distinct (userId, userName, role) tuples seen in the audit log. Used by the
+ * UI to populate a user filter dropdown without a separate users API call.
+ */
+function distinctActors() {
+  const seen = new Map();
+  for (const e of entries) {
+    if (!e.userId) continue;
+    if (seen.has(e.userId)) continue;
+    seen.set(e.userId, {
+      userId: e.userId,
+      userName: e.userName,
+      role: e.role,
+    });
+  }
+  return Array.from(seen.values()).sort((a, b) =>
+    (a.userName || "").localeCompare(b.userName || "")
+  );
 }
 
 function summary() {
@@ -74,4 +113,11 @@ function summary() {
   };
 }
 
-module.exports = { record, shouldSkip, list, summary, MAX_ENTRIES };
+module.exports = {
+  record,
+  shouldSkip,
+  list,
+  summary,
+  distinctActors,
+  MAX_ENTRIES,
+};

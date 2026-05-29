@@ -293,8 +293,10 @@ function buildPrefs() {
 
 let menu = store.load("cafeteria-menu", () => JSON.parse(JSON.stringify(SEED_MENU)));
 let prefs = store.load("cafeteria-prefs", buildPrefs);
+let orders = store.load("cafeteria-orders", () => []);
 const persistMenu = () => store.save("cafeteria-menu", menu);
 const persistPrefs = () => store.save("cafeteria-prefs", prefs);
+const persistOrders = () => store.save("cafeteria-orders", orders);
 
 function todayKey() {
   // JS Sunday=0..Saturday=6 → map to our Mon-first ordering
@@ -416,12 +418,199 @@ function summary() {
   };
 }
 
+// =========================================================================
+// MEAL PRE-ORDERS
+//
+// A simple booking flow: a parent (or the student themselves) reserves a
+// meal for a specific calendar date. The cost is locked from the menu at
+// order time. Orders can't be placed in the past, and existing orders
+// can only be cancelled before they're marked served by kitchen staff.
+// =========================================================================
+
+const ORDER_STATUSES = ["pending", "confirmed", "served", "cancelled"];
+const PAYMENT_STATUSES = ["unpaid", "paid"];
+
+function dayKeyFor(isoDate) {
+  // Map YYYY-MM-DD → our Mon-first day key
+  const d = new Date(isoDate + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return null;
+  const jsDay = d.getDay();
+  const idx = jsDay === 0 ? 6 : jsDay - 1;
+  return DAYS[idx];
+}
+
+function isoToday() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function nextOrderId() {
+  let max = 0;
+  for (const o of orders) {
+    const n = parseInt(String(o.id).replace(/\D+/g, ""), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `ORD${String(max + 1).padStart(6, "0")}`;
+}
+
+function listOrders({ studentId, date, meal, status } = {}) {
+  let out = orders;
+  if (studentId) out = out.filter((o) => o.studentId === studentId);
+  if (date) out = out.filter((o) => o.date === date);
+  if (meal) out = out.filter((o) => o.meal === meal);
+  if (status) out = out.filter((o) => o.status === status);
+  // Newest first by date then createdAt
+  return [...out].sort((a, b) => {
+    if (a.date !== b.date) return b.date.localeCompare(a.date);
+    return b.createdAt.localeCompare(a.createdAt);
+  });
+}
+
+function getOrder(id) {
+  return orders.find((o) => o.id === id) || null;
+}
+
+/**
+ * Look up the cost & item summary for (date, meal) — used when a new order
+ * is created so the price is locked at booking time rather than re-read
+ * later (the menu may change).
+ */
+function snapshotMealAt(date, meal) {
+  const day = dayKeyFor(date);
+  if (!day) throw new Error("Invalid date");
+  if (!MEALS.includes(meal)) throw new Error("Invalid meal");
+  const entry = menu[day]?.[meal];
+  if (!entry) throw new Error("No menu set for that date/meal");
+  return {
+    day,
+    items: Array.isArray(entry.items) ? [...entry.items] : [],
+    cost: Number(entry.cost) || 0,
+    vegetarian: !!entry.vegetarian,
+    calories: Number(entry.calories) || 0,
+    allergens: Array.isArray(entry.allergens) ? [...entry.allergens] : [],
+  };
+}
+
+function createOrder({ studentId, date, meal, notes, createdBy }) {
+  if (!studentId) throw new Error("studentId is required");
+  if (!date) throw new Error("date is required");
+  if (date < isoToday())
+    throw new Error("Cannot order meals for past dates");
+  if (!MEALS.includes(meal)) throw new Error("Invalid meal");
+  // Prevent duplicates: same student + date + meal that isn't cancelled.
+  const dupe = orders.find(
+    (o) =>
+      o.studentId === studentId &&
+      o.date === date &&
+      o.meal === meal &&
+      o.status !== "cancelled"
+  );
+  if (dupe) {
+    throw new Error(
+      `Already ordered ${meal} for ${date} (order ${dupe.id})`
+    );
+  }
+  const snap = snapshotMealAt(date, meal);
+  const now = new Date().toISOString();
+  const order = {
+    id: nextOrderId(),
+    studentId,
+    date,
+    day: snap.day,
+    meal,
+    items: snap.items,
+    cost: snap.cost,
+    vegetarian: snap.vegetarian,
+    calories: snap.calories,
+    allergens: snap.allergens,
+    notes: notes ? String(notes).slice(0, 280) : "",
+    status: "pending",
+    paymentStatus: "unpaid",
+    createdAt: now,
+    createdBy: createdBy || null,
+    servedAt: null,
+    cancelledAt: null,
+  };
+  orders.push(order);
+  persistOrders();
+  return order;
+}
+
+function updateOrder(id, patch) {
+  const o = orders.find((x) => x.id === id);
+  if (!o) throw new Error("Order not found");
+  if (o.status === "served") throw new Error("Order has been served — cannot edit");
+  if (o.status === "cancelled") throw new Error("Order is already cancelled");
+  if (patch.notes !== undefined) o.notes = String(patch.notes).slice(0, 280);
+  if (patch.paymentStatus !== undefined) {
+    if (!PAYMENT_STATUSES.includes(patch.paymentStatus))
+      throw new Error("Invalid paymentStatus");
+    o.paymentStatus = patch.paymentStatus;
+  }
+  if (patch.status !== undefined) {
+    if (!ORDER_STATUSES.includes(patch.status))
+      throw new Error("Invalid status");
+    o.status = patch.status;
+    if (patch.status === "served") o.servedAt = new Date().toISOString();
+    if (patch.status === "cancelled")
+      o.cancelledAt = new Date().toISOString();
+  }
+  persistOrders();
+  return o;
+}
+
+function cancelOrder(id) {
+  const o = orders.find((x) => x.id === id);
+  if (!o) throw new Error("Order not found");
+  if (o.status === "served")
+    throw new Error("Order has been served — cannot cancel");
+  if (o.status === "cancelled") return o;
+  o.status = "cancelled";
+  o.cancelledAt = new Date().toISOString();
+  persistOrders();
+  return o;
+}
+
+function markServed(id) {
+  return updateOrder(id, { status: "served" });
+}
+
+/**
+ * Headcount + total revenue per meal slot for a given date. Used by the
+ * kitchen / admin "today's prep" view.
+ */
+function ordersSummary(date) {
+  date = date || isoToday();
+  const byMeal = {};
+  for (const m of MEALS) {
+    byMeal[m] = { count: 0, paid: 0, unpaid: 0, served: 0, revenue: 0 };
+  }
+  for (const o of orders) {
+    if (o.date !== date) continue;
+    if (o.status === "cancelled") continue;
+    const m = byMeal[o.meal];
+    if (!m) continue;
+    m.count++;
+    m.revenue += o.cost || 0;
+    if (o.paymentStatus === "paid") m.paid++;
+    else m.unpaid++;
+    if (o.status === "served") m.served++;
+  }
+  return {
+    date,
+    byMeal,
+    totalOrders: MEALS.reduce((s, m) => s + byMeal[m].count, 0),
+    totalRevenue: MEALS.reduce((s, m) => s + byMeal[m].revenue, 0),
+  };
+}
+
 module.exports = {
   DAYS,
   MEALS,
   MEAL_PLANS,
   COMMON_ALLERGENS,
   SPECIAL_DIETS,
+  ORDER_STATUSES,
+  PAYMENT_STATUSES,
   todayKey,
   getDay,
   getWeek,
@@ -431,4 +620,13 @@ module.exports = {
   atRiskForMeal,
   prefs: () => prefs,
   summary,
+  // orders
+  listOrders,
+  getOrder,
+  createOrder,
+  updateOrder,
+  cancelOrder,
+  markServed,
+  ordersSummary,
+  snapshotMealAt,
 };

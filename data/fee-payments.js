@@ -105,6 +105,158 @@ function buildSeed() {
 let payments = store.load("fee-payments", buildSeed);
 const persist = () => store.save("fee-payments", payments);
 
+// Pending payment orders — Razorpay-style two-step flow. The parent (or
+// other authed user) creates an order; the mock "gateway" then captures it
+// which materialises into an actual Payment record above. Pending orders
+// expire after ORDER_TTL_MS so a parent who closes the modal mid-flow
+// doesn't leave hanging orders that block re-paying.
+let orders = store.load("fee-orders", () => []);
+const persistOrders = () => store.save("fee-orders", orders);
+const ORDER_TTL_MS = 15 * 60 * 1000;
+
+const ORDER_STATUSES = ["pending", "captured", "failed", "cancelled", "expired"];
+
+function nextOrderId() {
+  let max = 0;
+  for (const o of orders) {
+    const n = parseInt(String(o.id).replace(/\D+/g, ""), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `ORD${String(max + 1).padStart(6, "0")}`;
+}
+
+// Mark stale pending orders as expired. Called on every read path so the
+// status is always up-to-date without a background sweeper.
+function expireStaleOrders() {
+  const now = Date.now();
+  let changed = false;
+  for (const o of orders) {
+    if (o.status === "pending" && new Date(o.expiresAt).getTime() < now) {
+      o.status = "expired";
+      changed = true;
+    }
+  }
+  if (changed) persistOrders();
+}
+
+function createOrder(payload, user) {
+  if (!payload.studentId) throw new Error("studentId required");
+  const amount = Number(payload.amount);
+  if (!amount || amount <= 0) throw new Error("Valid amount required");
+  if (amount > 10_00_000) throw new Error("Amount exceeds single-payment limit");
+  if (payload.mode && !PAYMENT_MODES.includes(payload.mode))
+    throw new Error("Invalid payment mode");
+  const student = seed.students.find((s) => s.id === payload.studentId);
+  if (!student) throw new Error("Student not found");
+
+  // Don't allow a second pending order for the same student+amount inside
+  // the TTL — protect against accidental double-creation when a user
+  // double-clicks "Pay Now".
+  expireStaleOrders();
+  const dup = orders.find(
+    (o) =>
+      o.status === "pending" &&
+      o.studentId === student.id &&
+      o.amount === amount
+  );
+  if (dup) return dup;
+
+  const now = Date.now();
+  const order = {
+    id: nextOrderId(),
+    studentId: student.id,
+    amount,
+    mode: payload.mode || "UPI",
+    breakdown:
+      payload.breakdown && typeof payload.breakdown === "object"
+        ? payload.breakdown
+        : { tuition: amount },
+    notes: payload.notes || null,
+    paidBy: payload.paidBy || student.parent || user?.name || "—",
+    status: "pending",
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ORDER_TTL_MS).toISOString(),
+    createdBy: user?.sub || user?.id || null,
+    capturedAt: null,
+    paymentId: null,
+    gatewayRefId: null,
+  };
+  orders.unshift(order);
+  persistOrders();
+  return order;
+}
+
+function getOrder(orderId) {
+  expireStaleOrders();
+  return orders.find((o) => o.id === orderId) || null;
+}
+
+function listOrders({ studentId, status } = {}) {
+  expireStaleOrders();
+  let out = orders.slice();
+  if (studentId) out = out.filter((o) => o.studentId === studentId);
+  if (status) out = out.filter((o) => o.status === status);
+  return out.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+// Capture an order — simulates the gateway success callback. In a real
+// integration this would verify a signed payload (Razorpay's hmac of
+// order_id|payment_id with the key secret). Here we accept an optional
+// gatewayRefId or generate one; if `forceFail` is true we route through the
+// failure path for testing.
+function captureOrder(orderId, { gatewayRefId, forceFail } = {}) {
+  expireStaleOrders();
+  const order = orders.find((o) => o.id === orderId);
+  if (!order) throw new Error("Order not found");
+  if (order.status === "captured")
+    throw new Error("Order has already been captured");
+  if (order.status !== "pending")
+    throw new Error(`Order is ${order.status}`);
+
+  const ref =
+    gatewayRefId ||
+    `pay_${(hash(order.id, Date.now()) % 1e10).toString(36)}`;
+
+  if (forceFail) {
+    order.status = "failed";
+    order.gatewayRefId = ref;
+    persistOrders();
+    return { order, payment: null };
+  }
+
+  // Create the Payment record by reusing recordPayment with status forced
+  // to Success — this is the gateway-confirmed path, no probabilistic
+  // success/fail simulation.
+  const payment = recordPayment({
+    studentId: order.studentId,
+    amount: order.amount,
+    mode: order.mode,
+    breakdown: order.breakdown,
+    paidBy: order.paidBy,
+    notes: order.notes,
+    txnRef: ref,
+    status: "Success",
+  });
+
+  order.status = "captured";
+  order.capturedAt = new Date().toISOString();
+  order.paymentId = payment.id;
+  order.gatewayRefId = ref;
+  persistOrders();
+  return { order, payment };
+}
+
+function cancelOrder(orderId) {
+  expireStaleOrders();
+  const order = orders.find((o) => o.id === orderId);
+  if (!order) throw new Error("Order not found");
+  if (order.status !== "pending")
+    throw new Error(`Cannot cancel an order in status ${order.status}`);
+  order.status = "cancelled";
+  persistOrders();
+  return order;
+}
+
 function nextSeq() {
   return payments.length + 1;
 }
@@ -248,6 +400,8 @@ function summary() {
 module.exports = {
   PAYMENT_MODES,
   PAYMENT_STATUSES,
+  ORDER_STATUSES,
+  ORDER_TTL_MS,
   annualFeesFor,
   listPayments,
   getPayment,
@@ -255,4 +409,10 @@ module.exports = {
   recordPayment,
   summary,
   payments: () => payments,
+  // order/capture flow
+  createOrder,
+  getOrder,
+  listOrders,
+  captureOrder,
+  cancelOrder,
 };
