@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -69,9 +70,10 @@ const JWT_SECRET = process.env.JWT_SECRET || "lumina-dev-secret-change-in-prod";
 const JWT_TTL = "12h";
 
 app.use(cors());
-// 5 MB body limit so /api/admin/restore can accept full snapshots.
-// All other endpoints have payloads well below 100 KB.
-app.use(express.json({ limit: "5mb" }));
+// 10 MB body limit so /api/admin/restore can accept full snapshots, and so
+// assignment create/update can carry a handful of inline base64 photos.
+// Most other endpoints have payloads well below 100 KB.
+app.use(express.json({ limit: "10mb" }));
 
 // --- in-memory store (some collections now persisted via data/store.js) ---
 const db = {
@@ -2928,9 +2930,16 @@ app.get("/api/assignments", (req, res) => {
     });
   }
 
+  // Strip the heavy base64 image payloads from the list — cards only need to
+  // know how many photos exist. The full images come from GET /:id (detail).
+  const items = list.map((a) => {
+    const { images, ...rest } = a;
+    return { ...rest, imageCount: Array.isArray(images) ? images.length : 0 };
+  });
+
   res.json({
-    total: list.length,
-    items: list,
+    total: items.length,
+    items,
     subjects: assignmentsData.VALID_SUBJECTS,
   });
 });
@@ -2994,6 +3003,7 @@ app.get("/api/assignments/:id", (req, res) => {
               status: sub.status,
               submittedAt: sub.submittedAt,
               text: sub.text,
+              images: sub.images || [],
               marks: sub.marks,
               feedback: sub.feedback,
             }

@@ -18,6 +18,30 @@ const VALID_SUBJECTS = [
 
 const SUB_STATUSES = ["Submitted", "Graded", "Late"];
 
+// Assignment photos (e.g. a teacher snapping the worksheet) are stored inline
+// as base64 data URLs — same approach as profile photos, since this app has no
+// external file store. The client resizes before upload, so real payloads are
+// small; these caps just guard against accidental full-resolution dumps.
+const MAX_ASSIGNMENT_IMAGES = 6;
+const ASSIGNMENT_IMAGE_MAX_BYTES = 1024 * 1024; // ~1 MB per image (base64 chars)
+
+function validateImages(value) {
+  if (!Array.isArray(value)) throw new Error("images must be an array");
+  if (value.length > MAX_ASSIGNMENT_IMAGES)
+    throw new Error(`too many images (max ${MAX_ASSIGNMENT_IMAGES})`);
+  return value.map((img) => {
+    if (typeof img !== "string")
+      throw new Error("each image must be a data:image base64 string");
+    if (!/^data:image\/(png|jpe?g|webp|gif);base64,/.test(img))
+      throw new Error("images must be data:image/... base64 URLs");
+    if (img.length > ASSIGNMENT_IMAGE_MAX_BYTES)
+      throw new Error(
+        `an image is too large (max ${Math.round(ASSIGNMENT_IMAGE_MAX_BYTES / 1024)} KB each)`
+      );
+    return img;
+  });
+}
+
 let assignments = store.load("assignments", () => []);
 let submissions = store.load("submissions", () => []);
 
@@ -96,6 +120,10 @@ function validateAssignmentPayload(p, { partial = false } = {}) {
     }
   } else if (!partial) out.maxMarks = null;
 
+  if (p.images !== undefined) {
+    out.images = validateImages(p.images);
+  } else if (!partial) out.images = [];
+
   return out;
 }
 
@@ -173,7 +201,10 @@ function submitAssignment(assignmentId, studentId, payload = {}) {
   if (!a) throw new Error("Assignment not found");
   if (!studentId) throw new Error("studentId required");
   const text = String(payload.text || "").trim().slice(0, 8000);
-  if (!text) throw new Error("Submission text is required");
+  // Students can submit a written answer, photos of the solved sheet, or both.
+  const images = payload.images !== undefined ? validateImages(payload.images) : [];
+  if (!text && images.length === 0)
+    throw new Error("Add an answer — write something or attach a photo");
 
   const now = new Date();
   const due = new Date(a.dueAt);
@@ -185,6 +216,7 @@ function submitAssignment(assignmentId, studentId, payload = {}) {
     if (existing.status === "Graded")
       throw new Error("This submission has already been graded");
     existing.text = text;
+    existing.images = images;
     existing.submittedAt = now.toISOString();
     existing.status = status;
     persistS();
@@ -196,6 +228,7 @@ function submitAssignment(assignmentId, studentId, payload = {}) {
     assignmentId,
     studentId,
     text,
+    images,
     submittedAt: now.toISOString(),
     marks: null,
     feedback: null,
@@ -248,6 +281,7 @@ function summaryForAssignment(assignmentId, eligibleStudentIds) {
 module.exports = {
   VALID_SUBJECTS,
   SUB_STATUSES,
+  MAX_ASSIGNMENT_IMAGES,
   listAssignments,
   getAssignment,
   addAssignment,
