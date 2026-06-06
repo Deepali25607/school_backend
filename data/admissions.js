@@ -74,6 +74,39 @@ function move(id, toStage) {
   return a;
 }
 
+// Toggle the uploaded / verified state of a single document on an applicant.
+// Rules that keep the two flags coherent:
+//   - a verified document is, by definition, also uploaded
+//   - a document that is not uploaded ("Missing") can never stay verified
+function setDocument(id, docName, patch) {
+  const a = applicants.find((x) => x.id === id);
+  if (!a) throw new Error("Not found");
+  const doc = (a.documents || []).find((d) => d.name === docName);
+  if (!doc) throw new Error("Unknown document");
+  if (patch.uploaded !== undefined) {
+    doc.uploaded = !!patch.uploaded;
+    if (!doc.uploaded) doc.verified = false; // a missing doc can't stay verified
+  }
+  if (patch.verified !== undefined) {
+    doc.verified = !!patch.verified;
+    if (doc.verified) doc.uploaded = true; // verifying implies the doc was received
+  }
+  persist();
+  return a;
+}
+
+// Record the Student record auto-created when an applicant is enrolled, so the
+// linkage survives restarts and the enrollment stays idempotent (we never
+// create a second student for the same applicant).
+function setStudentId(id, studentId) {
+  const a = applicants.find((x) => x.id === id);
+  if (a) {
+    a.studentId = studentId;
+    persist();
+  }
+  return a;
+}
+
 function add(payload) {
   const id = `ADM${2000 + applicants.length + 1}`;
   const fn = payload.name?.split(" ")[0] || "New";
@@ -101,4 +134,4 @@ function add(payload) {
   return a;
 }
 
-module.exports = { STAGES, applicants: () => applicants, move, add };
+module.exports = { STAGES, applicants: () => applicants, move, add, setStudentId, setDocument };

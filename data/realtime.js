@@ -109,6 +109,7 @@ function eventTypeFor(path, method) {
   if (path.startsWith("/api/leave")) return "leave.changed";
   if (path.startsWith("/api/maintenance")) return "maintenance.changed";
   if (path.startsWith("/api/visitors")) return "visitors.changed";
+  if (path.startsWith("/api/doc-records")) return "doc-records.changed";
   if (path.startsWith("/api/documents")) return "documents.changed";
   if (path.startsWith("/api/health")) return "health.changed";
   if (path.startsWith("/api/discipline")) return "discipline.changed";

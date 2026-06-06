@@ -20,6 +20,7 @@ const leaveData = require("./data/leave");
 const maintenanceData = require("./data/maintenance");
 const visitorsData = require("./data/visitors");
 const documentsData = require("./data/documents");
+const docRecordsData = require("./data/doc-records");
 const healthData = require("./data/health");
 const disciplineData = require("./data/discipline");
 const safeReportsData = require("./data/safe-reports");
@@ -1070,6 +1071,7 @@ app.get("/api/students/:id/profile", (req, res) => {
           summary: { total: 0, Requested: 0, Approved: 0, Issued: 0, Rejected: 0 },
           items: [],
         },
+        docRecords: { items: [], summary: { total: 0, uploaded: 0, verified: 0, missing: 0 } },
         activity: [],
       });
     }
@@ -1236,6 +1238,10 @@ app.get("/api/students/:id/profile", (req, res) => {
       recent: recentAchievements,
     },
     documents: { summary: docSummary, items: docs },
+    docRecords: {
+      items: docRecordsData.listFor("student", studentId),
+      summary: docRecordsData.summaryFor("student", studentId),
+    },
     exams: {
       total: examResults.length,
       avgPct:
@@ -1520,6 +1526,10 @@ app.get("/api/teachers/:id/profile", (req, res) => {
     discipline: {
       total: incidentsLogged.length,
       recent: incidentsLogged,
+    },
+    docRecords: {
+      items: docRecordsData.listFor("teacher", id),
+      summary: docRecordsData.summaryFor("teacher", id),
     },
     activity: recentActivity,
   });
@@ -3998,7 +4008,7 @@ app.get("/api/learning/live", (req, res) => {
   const { status } = req.query;
   const myGrades = learningGradesFor(req);
   // recompute live/scheduled/ended based on `new Date()`
-  let items = learningData.live.map((c) => {
+  let items = learningData.live().map((c) => {
     const start = new Date(c.startsAt);
     const end = new Date(c.endsAt);
     const now = new Date();
@@ -4015,7 +4025,7 @@ app.get("/api/learning/live", (req, res) => {
 app.get("/api/learning/recordings", (req, res) => {
   const { q = "", subject = "all" } = req.query;
   const myGrades = learningGradesFor(req);
-  let list = learningData.recordings;
+  let list = learningData.recordings();
   if (myGrades) list = list.filter((r) => myGrades.has(r.grade));
   if (subject !== "all") list = list.filter((r) => r.subject === subject);
   if (q) {
@@ -4035,7 +4045,7 @@ app.get("/api/learning/materials", (req, res) => {
   // content shared across grades for a subject. For teacher callers we can
   // at least narrow by subjects they teach; students/parents see everything
   // until materials gain a grade tag.
-  let list = learningData.materials;
+  let list = learningData.materials();
   const role = req.user?.role;
   if (role === "teacher") {
     const t = resolveTeacherScope(req.user);
@@ -4045,6 +4055,83 @@ app.get("/api/learning/materials", (req, res) => {
     }
   }
   res.json({ total: list.length, items: list });
+});
+
+// Reference data for the create/upload forms (subjects, teachers, platforms…).
+app.get("/api/learning/meta", (req, res) => {
+  res.json({
+    subjects: learningData.SUBJECTS,
+    teachers: learningData.TEACHERS,
+    platforms: learningData.PLATFORMS,
+    materialTypes: learningData.MATERIAL_TYPES,
+  });
+});
+
+// ----- Create / manage live classes -----
+app.post("/api/learning/live", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.status(201).json(learningData.addLive(req.body || {}));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/learning/live/:id", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.json(learningData.removeLive(req.params.id));
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
+});
+
+// ----- Manage recorded sessions -----
+app.post("/api/learning/recordings", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.status(201).json(learningData.addRecording(req.body || {}));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/learning/recordings/:id", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.json(learningData.removeRecording(req.params.id));
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
+});
+
+app.post("/api/learning/recordings/:id/view", (req, res) => {
+  try {
+    res.json(learningData.viewRecording(req.params.id));
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
+});
+
+// ----- Upload / manage study material -----
+app.post("/api/learning/materials", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.status(201).json(learningData.addMaterial(req.body || {}));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/learning/materials/:id", requireRole("admin", "principal", "teacher"), (req, res) => {
+  try {
+    res.json(learningData.removeMaterial(req.params.id));
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
+});
+
+app.post("/api/learning/materials/:id/download", (req, res) => {
+  try {
+    res.json(learningData.downloadMaterial(req.params.id));
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
 });
 
 // ============ ADMISSIONS ============
@@ -4087,9 +4174,103 @@ app.post("/api/admissions", requireRole("admin", "principal"), (req, res) => {
 app.patch("/api/admissions/:id/move", requireRole("admin", "principal"), (req, res) => {
   try {
     const a = admissionsData.move(req.params.id, req.body?.stage);
+    // Once an applicant is finalized as "Enrolled", promote them into a real
+    // Student record automatically. Idempotent: an applicant that already has a
+    // linked student (e.g. moved back and forth through stages) is not cloned.
+    // Applicants that end in "Rejected" never reach this branch, so no student
+    // is ever created for a rejected enquiry.
+    if (a.stage === "Enrolled" && !a.studentId) {
+      const grade = Math.min(12, Math.max(1, Number(a.gradeApplied) || 1));
+      const student = {
+        id: nextStudentId(),
+        name: a.name,
+        avatar: avatarFromName(a.name),
+        grade,
+        section: "A",
+        house: "Azure",
+        attendance: 100,
+        feeStatus: "Pending",
+        parent: a.parentName || "",
+        contact: a.parentContact || "",
+        gpa: "3.50",
+        photoUrl: null,
+        transport: null,
+      };
+      db.students.push(student);
+      persistStudents();
+      // Carry the enquiry documents (Birth Certificate, Aadhaar, etc.) over
+      // into the new student's document file, preserving uploaded/verified state.
+      docRecordsData.seedFromApplicant(student.id, a.documents);
+      admissionsData.setStudentId(a.id, student.id);
+    }
     res.json(a);
   } catch (e) {
     res.status(400).json({ error: e.message });
+  }
+});
+
+// Mark an applicant's document as uploaded and/or verified. Body accepts
+// { name, uploaded?, verified? }. Used by the admissions modal so staff can
+// tick a document verified (or untick it back to "Missing").
+app.patch("/api/admissions/:id/document", requireRole("admin", "principal"), (req, res) => {
+  try {
+    const { name, uploaded, verified } = req.body || {};
+    if (!name) return res.status(400).json({ error: "document name required" });
+    const a = admissionsData.setDocument(req.params.id, name, { uploaded, verified });
+    res.json(a);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ============ DOCUMENT RECORDS (personal document file) ============
+// The actual papers on file for a student or teacher — Birth Certificate,
+// Aadhaar, Degree, etc. — each with uploaded / verified state. Distinct from
+// the certificate-issuance workflow served by /api/documents.
+function resolveDocOwner(ownerType, ownerId) {
+  if (ownerType === "student") return db.students.find((s) => s.id === ownerId) || null;
+  if (ownerType === "teacher") return db.teachers.find((t) => t.id === ownerId) || null;
+  return null;
+}
+
+app.get("/api/doc-records/:ownerType/:ownerId", (req, res) => {
+  const { ownerType, ownerId } = req.params;
+  if (!docRecordsData.OWNER_TYPES.includes(ownerType))
+    return res.status(400).json({ error: "Invalid ownerType" });
+  res.json({
+    items: docRecordsData.listFor(ownerType, ownerId),
+    summary: docRecordsData.summaryFor(ownerType, ownerId),
+    suggested: docRecordsData.SUGGESTED[ownerType] || [],
+  });
+});
+
+app.post("/api/doc-records", requireRole("admin", "principal"), (req, res) => {
+  try {
+    const { ownerType, ownerId } = req.body || {};
+    if (!resolveDocOwner(ownerType, ownerId))
+      return res.status(404).json({ error: "Owner not found" });
+    const rec = docRecordsData.add(req.body || {});
+    res.status(201).json(rec);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.patch("/api/doc-records/:id", requireRole("admin", "principal"), (req, res) => {
+  try {
+    const rec = docRecordsData.update(req.params.id, req.body || {});
+    res.json(rec);
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/doc-records/:id", requireRole("admin", "principal"), (req, res) => {
+  try {
+    const removed = docRecordsData.remove(req.params.id);
+    res.json(removed);
+  } catch (e) {
+    res.status(e.message === "Not found" ? 404 : 400).json({ error: e.message });
   }
 });
 
